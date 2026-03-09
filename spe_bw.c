@@ -41,24 +41,57 @@
 #define BIT_SET(_fld) (_reg & BIT(_fld ## _SHIFT))
 #define FIELD_GET_LOCAL(_fld, _reg) (_reg >> _fld ## _SHIFT & _fld ## _MASK)
 #define FIELD_SET_LOCAL(_fld, _reg) ((_reg & _fld ## _MASK) << _fld ## _SHIFT )
+//assert(typeof(var1)==typeof(var2))
+#define SWAP(var1, var2) 	\
+do {				\
+	typeof(var1) temp;	\
+	temp = var1;		\
+	var1 = var2;		\
+	var2 = temp;		\
+}while(0);
 //#define MY_READ_SYSREG(reg) 
 
+//TODO: this should be a module parameter
+#define BUFFER_SIZE (1 << 21)
 #define SPE_BW_PERIOD 4096
 #define WATERMARK_NUM 1
 #define WATERMARK_DEN 2
 
+#define OTHER_BUFFER(active_one) ((active_one + 1) % 2)
+/**************************************************************************
+ * Public Types
+ **************************************************************************/
+
+struct spe_buffer {
+	void *buf;
+	void *limit;
+	void *watermark;
+	char ready;
+};
+
+struct core_info{
+	struct spe_buffer primary;
+	struct spe_buffer secondary;
+	unsigned int active_buffer;
+	void *buffer_base;
+	/*
+	 * TODO: [IDEA] pass only core_info and have it pointing to 
+	 * global spe_ctrl
+	 * struct spe_ctrl *spe_ctrl;
+	*/
+};
+
 struct spe_ctrl {
 	size_t size;
-	void *buf;
-	void *base;
-	void* limit;
-	void* water_mark;
+	// void *buf;
+	// void *base;
+	// void* limit;
+	// void* water_mark;
 
-	void *secondary_buf, *secondary_limit,*secondary_watermark;
-	ssize_t offset;
-	unsigned int active_buffer;
+	// void *secondary_buf, *secondary_limit,*secondary_watermark;
+	// unsigned int active_buffer;
 	//interrupts = <0x01 0x05 0x04>;
-	//             <Type(PPI) Number TriggerType(active high level sensitive)>
+	//		<Type(PPI) Number TriggerType(active high level sensitive)>
 	int irq;
 
 	bool filter_ld;
@@ -71,7 +104,7 @@ struct spe_ctrl {
 	unsigned int period;
 	unsigned int advance;
 
-	int target_cpu;
+	cpumask_var_t target_cpu;
 	int reader_cpu;
 
 	struct task_struct *reader_task;
@@ -79,22 +112,27 @@ struct spe_ctrl {
 	bool running;
 };
 
-struct spe_buf {
-
-};
-
-static struct spe_ctrl spe;
-static unsigned int extended_packets = 0;
-
-static struct kobject *spe_kobj;
-
 enum spe_bw_buf_fault_action {
 	SPE_BW_BUF_FAULT_ACT_SPURIOUS,
 	SPE_BW_BUF_FAULT_ACT_FATAL,
 	SPE_BW_BUF_FAULT_ACT_OK,
 };
 
+/**************************************************************************
+ * Global Variables
+ **************************************************************************/
+static struct spe_ctrl spe;
+static struct core_info __percpu *core_info;
+static unsigned int extended_packets = 0;
+
+static struct kobject *spe_kobj;
+
+static char string_buffer[255];
+static char string_short_buffer[255];
 //struct kobj_attribute etx_attr = __ATTR(etx_value, 0660, sysfs_show, sysfs_store);
+/**************************************************************************
+ * Local Function Prototypes
+ **************************************************************************/
 
 static ssize_t sysfs_store_control(struct kobject *kobj, struct kobj_attribute *attr,
 			     const char *buf, size_t count);
@@ -113,10 +151,9 @@ static struct kobj_attribute target_cpu_attr = __ATTR(target_cpu, 0664, NULL,
 							sysfs_store_target_cpu);
 
 
-static char string_buffer[255];
-static char string_short_buffer[255];
-
-
+/**************************************************************************
+ * Module main code
+ **************************************************************************/
 static void spe_bw_disable_and_drain_local(void)
 {
 	/* Disable profiling at EL0 and EL1 */
@@ -175,6 +212,7 @@ static u64 spe_bw_fill_pmscr(void)
 static void spe_bw_manage_buffer(void *info){
 	unsigned int cpu = smp_processor_id();
 	struct spe_ctrl *spe_ctrl = (struct spe_ctrl*) info;
+	struct core_info *cinfo = this_cpu_ptr(core_info);
 	void* secondary_buf,*secondary_limit;
 	u64 reg;
 
@@ -183,15 +221,16 @@ static void spe_bw_manage_buffer(void *info){
 	reg = read_sysreg_s(SYS_PMBPTR_EL1);
 	
 	//Communicate limit
-	spe_ctrl->limit = (void*) reg;
+	cinfo->primary.limit = (void*) reg;
 	//TODO: Missing check for syndrome
 	write_sysreg_s(0, SYS_PMBSR_EL1);
 
 	//Allocate secondary_buffer
-	secondary_buf = spe_ctrl->base + 
-			((spe_ctrl->active_buffer + 1)%2) * spe_ctrl->size/2;
-	memset(secondary_buf,0xff,spe_ctrl->size/2);
-	secondary_limit = secondary_buf + spe_ctrl->size/2;
+	secondary_buf = cinfo->buffer_base
+			+ OTHER_BUFFER(cinfo->active_buffer) 
+			* spe_ctrl->size;
+	memset(secondary_buf,0xff,spe_ctrl->size);
+	secondary_limit = secondary_buf + spe_ctrl->size;
 	// Ensure memset is completed
 	wmb();
 	write_sysreg_s(secondary_buf, SYS_PMBPTR_EL1);
@@ -201,13 +240,14 @@ static void spe_bw_manage_buffer(void *info){
 	write_sysreg_s(reg, SYS_PMBLIMITR_EL1);
 	isb();
 
-	spe_ctrl->secondary_buf = secondary_buf;
-	spe_ctrl->secondary_watermark = secondary_buf 
-	+ (spe_ctrl->size/2)
-	* WATERMARK_NUM
-	/ WATERMARK_DEN;
+	cinfo->secondary.buf = secondary_buf;
+	cinfo->secondary.limit = secondary_limit;
+	cinfo->secondary.watermark = secondary_buf 
+			+ (spe_ctrl->size)
+			* WATERMARK_NUM
+			/ WATERMARK_DEN;
 	wmb();
-	spe_ctrl->secondary_limit = secondary_limit;
+	cinfo->secondary.ready = 1;
 	// Set other flags and start sampling
 	reg = spe_bw_fill_pmscr();
 	write_sysreg_s(reg, SYS_PMSCR_EL1);
@@ -334,15 +374,12 @@ static int process_record(void *base){
 static void spe_enable_cpu(void *info)
 {
 	struct spe_ctrl *s = info;
-    	u64 reg = 0;
-	
-	s->buf = s->base;
-	s->limit = s->buf + s->size/2;
-	s->water_mark = s->buf + (s->size/2) * WATERMARK_NUM / WATERMARK_DEN;
-	pr_info("Buffer at address %llx\n", (u64)s->buf);
-
-	memset(s->buf, 0xff, s->size);
-	wmb();
+	u64 reg = 0;
+	struct core_info *cinfo = this_cpu_ptr(core_info);
+	smp_rmb();
+	pr_info("cpu %d : spe_enable",smp_processor_id());
+	pr_info("core_info address %llx",(u64)core_info);
+	pr_info("Buffer at address %llx\n", (u64)READ_ONCE(cinfo->buffer_base));
 
 	enable_percpu_irq(s->irq, IRQ_TYPE_NONE);
 	pr_info("Enabling irq %d on cpu %d", s->irq, smp_processor_id());
@@ -360,12 +397,11 @@ static void spe_enable_cpu(void *info)
 	//reg |= FIELD_SET_LOCAL(SYS_PMSIRR_EL1_INTERVAL, s->period);
 	reg |=  s->period;
 	write_sysreg_s(reg, SYS_PMSIRR_EL1);
-
 	
 	/* Program SPE buffer registers */
-	write_sysreg_s(s->buf, SYS_PMBPTR_EL1);
+	write_sysreg_s(cinfo->primary.buf, SYS_PMBPTR_EL1);
 
-	reg = (u64)(s->buf + s->size);
+	reg = (u64)(cinfo->primary.limit);
 	reg |= BIT(SYS_PMBLIMITR_EL1_E_SHIFT);
 	write_sysreg_s(reg, SYS_PMBLIMITR_EL1);
 	isb();
@@ -410,55 +446,76 @@ static void spe_disable_cpu(void *info)
 
 static int spe_reader(void *data)
 {
-    struct spe_ctrl *s = data;
-    int ret;
-    u64 ones_mask = ~0x0; // This should make an all ones mask
+	struct spe_ctrl *s = data;
+	int ret;
+	unsigned int cpu;
+	u64 ones_mask = ~0x0; // This should make an all ones mask
+	bool at_least_one_reading = true;
 
-    pr_info("SPE reader running on CPU %d\n", smp_processor_id());
+	pr_info("SPE reader running on CPU %d\n", smp_processor_id());
 
 
-    while (s->buf < READ_ONCE(s->limit) || !kthread_should_stop() ) {
+	while (at_least_one_reading || !kthread_should_stop() ) {
+		at_least_one_reading = false;
+		
+		for_each_cpu(cpu, s->target_cpu){
+			struct core_info * cinfo = this_cpu_ptr(core_info);
+			/*
+			 * spe_buf::limit can change out of the control of 
+			 * current thread's control.
+			*/
+			void *limit = READ_ONCE(cinfo->primary.limit);
+			smp_rmb();
+			if (cinfo->primary.buf < limit && 
+				READ_ONCE(
+					*(u64 *)(cinfo->primary.buf + s->advance)
+				) 
+				!= ones_mask) 
+			{
 
-	smp_rmb();
+				pr_debug("SPE record at %llx\n",(u64) cinfo->primary.buf);
 
-	if (s->buf < s->limit && 
-		READ_ONCE(*(u64 *)(s->buf + s->advance)) != ones_mask) {
+				ret = process_record(cinfo->primary.buf);
+				if(ret < 0){
+					pr_info("Unrecognised packet header: %x", (unsigned int)(-ret));
+				} else {
+					cinfo->primary.buf += 64UL;
 
-		pr_debug("SPE record at %llx\n",(u64) s->buf);
-
-		ret = process_record(s->buf);
-		if(ret < 0){
-			pr_info("Unrecognised packet header: %x", (unsigned int)(-ret));
-		} else {
-			s->buf += 64UL;
-
-			//With the equal comparison, it will only trigger once
-			if (s->buf == s->water_mark ){
-				pr_info("SPE reader:watermark hit\n");
-				if(0 != smp_call_function_single(s->target_cpu,
-					spe_bw_manage_buffer,
-					s, 0))
-				{				
-					pr_warn("error in calling " 
-						"spe_bw_manage_buffer");
-				}	
-				
+					//With the equal comparison, it will only trigger once
+					if (cinfo->primary.buf == cinfo->primary.watermark ){
+						pr_info("SPE reader:watermark hit\n");
+						if(0 != smp_call_function_single(cpu,
+							spe_bw_manage_buffer,
+							s, 0))
+						{				
+							pr_warn("error in calling " 
+								"spe_bw_manage_buffer");
+						}	
+						
+					}
+				}
+			}
+		
+			// Restore a waiting buffer, if the secondary is ready
+			if(cinfo->primary.buf == limit && 
+				READ_ONCE(cinfo->secondary.ready))
+			{
+				cinfo->active_buffer = OTHER_BUFFER(cinfo->active_buffer);
+				SWAP(cinfo->primary.buf,cinfo->secondary.buf);
+				SWAP(cinfo->primary.limit,cinfo->secondary.limit);
+				SWAP(cinfo->primary.watermark,cinfo->secondary.watermark);
+				smp_wmb();
+				cinfo->secondary.ready = 0;
+				// cinfo->primary
+				// s->buf = s->secondary_buf;
+				// s->limit = s->secondary_limit;
+				// s->water_mark = s->secondary_watermark;
 			}
 		}
+		cpu_relax();
 	}
-
-	if(s->buf == s->limit && 
-		READ_ONCE(s->secondary_buf) < READ_ONCE(s->secondary_limit))
-	{
-		s->active_buffer = (s->active_buffer + 1) % 2;
-		s->buf = s->secondary_buf;
-		s->limit = s->secondary_limit;
-		s->water_mark = s->secondary_watermark;
-	}
-	cpu_relax();
-    }
-    pr_info("SPE reader stopped on CPU %d\n", smp_processor_id());
-    return 0;
+	pr_info("SPE reader stopped on CPU %d\n", smp_processor_id());
+	return 0;
 }
 
 static ssize_t sysfs_store_control(struct kobject *kobj,
@@ -466,14 +523,59 @@ static ssize_t sysfs_store_control(struct kobject *kobj,
 			     const char *buf, size_t count)
 {	
 	// Resetting extended packets counter;
+	bool alloc_failed = false;
+	unsigned int i;
 	extended_packets = 0;
 	if (sysfs_streq(buf, "start")) {
 		if (spe.running)
 			return count;
+		
+		spe.size = BUFFER_SIZE;
+		for_each_cpu(i, spe.target_cpu){
+			struct core_info *cinfo = this_cpu_ptr(core_info);
+			pr_info("Executing sysfs_store_control for cpu %d",i);
+			pr_info("core_info address %llx",(u64)core_info);
+			// Allocate 2 buffers of size BUFFER_SIZE per core
+			cinfo->buffer_base = kmalloc(spe.size * 2, GFP_KERNEL);
+			if(!cinfo->buffer_base)
+				alloc_failed = true;
+			else
+				memset(cinfo->buffer_base, 0xff, spe.size * 2);
+			//TODO: This will be refactored to be more concise
+			cinfo->primary = (struct spe_buffer){
+				.buf = cinfo->buffer_base,
+				.limit = cinfo->buffer_base + spe.size,
+				.watermark = cinfo->buffer_base + 
+					(
+						spe.size
+						*WATERMARK_DEN
+						/WATERMARK_DEN
+					),
+				.ready = 0
+			};
+			cinfo->secondary = (struct spe_buffer){
+				.buf = cinfo->buffer_base + spe.size,
+				.limit = cinfo->buffer_base + 2 * spe.size,
+				.watermark = cinfo->buffer_base 
+					+ spe.size
+					+(
+						spe.size
+						*WATERMARK_DEN
+						/WATERMARK_DEN
+					),
+				.ready = 0
+			};
 
-		spe.size = 1<<(5+10+6);
-		spe.base = kmalloc(spe.size, GFP_KERNEL);
-		if(!spe.base){
+			cinfo->active_buffer = 0;
+			pr_info("cinfo->buffer_base: %llx",(u64)cinfo->buffer_base);
+			pr_info("cinfo->primary.buf: %llx",(u64)cinfo->primary.buf);
+		}
+		if(alloc_failed){
+			for_each_cpu(i, spe.target_cpu){
+				struct core_info *cinfo = this_cpu_ptr(core_info);
+				kfree(cinfo-> buffer_base);
+				cinfo-> buffer_base = NULL;
+			}
 			return -ENOMEM;
 		}
 		
@@ -490,12 +592,11 @@ static ssize_t sysfs_store_control(struct kobject *kobj,
 		wake_up_process(spe.reader_task);
 
 		/* Enable SPE on target CPU */
-		smp_call_function_single(spe.target_cpu,
+		smp_call_function_many(spe.target_cpu,
 					spe_enable_cpu,
 					&spe, 1);
 
 		spe.running = true;
-
 		pr_info("SPE started\n");
 	}
 
@@ -504,18 +605,28 @@ static ssize_t sysfs_store_control(struct kobject *kobj,
 		if (!spe.running)
 			return count;
 
-		smp_call_function_single(spe.target_cpu,
+		smp_call_function_many(spe.target_cpu,
 					spe_disable_cpu,
 					&spe, 1);
 
 		if (spe.reader_task)
 			kthread_stop(spe.reader_task);
 
-		kfree(spe.base);
+		for_each_cpu(i, spe.target_cpu){
+			struct core_info *cinfo = this_cpu_ptr(core_info);
+			kfree(cinfo-> buffer_base);
+			cinfo-> buffer_base = NULL;
+		}
 
 		spe.running = false;
 
 		pr_info("SPE stopped\n");
+		for_each_cpu(i, spe.target_cpu){
+			struct core_info *cinfo = this_cpu_ptr(core_info);
+			pr_info("Executing sysfs_store_control stop for cpu %d",i);
+			pr_info("cinfo->buffer_base: %llx",(u64)cinfo->buffer_base);
+			pr_info("cinfo->primary.buf: %llx",(u64)cinfo->primary.buf);
+		}
 		pr_info("Found %d extended packets\n",extended_packets);
 	
     }
@@ -527,9 +638,10 @@ static ssize_t sysfs_store_target_cpu(struct kobject *kobj,
 			     struct kobj_attribute *attr,
 			     const char *buf, size_t count)
 {
-    if(kstrtoint(buf, 10, &spe.target_cpu)<0)
-	return 0;
-    return count;
+	int ret;
+	if((ret = cpumask_parse(buf, spe.target_cpu)) < 0)
+		return ret;
+	return count;
 }
 
 static ssize_t sysfs_store_reader_cpu(struct kobject *kobj,
@@ -541,9 +653,14 @@ static ssize_t sysfs_store_reader_cpu(struct kobject *kobj,
     return count;
 }
 
+static int spe_bw_init_debugfs(void){
+	//TODO: to add some files here
+	return 0;
+}
+
 /* IRQ handling */
 static enum spe_bw_buf_fault_action
-spe_bw_buf_fault_act_get(struct spe_ctrl *handle)
+spe_bw_buf_fault_act_get(struct core_info *cinfo)
 {
 	const char *err_str;
 	u64 pmbsr;
@@ -615,12 +732,14 @@ out_stop:
 	 */
 	spe_disable_cpu(&spe);
 	if (spe.reader_task)
-	    kthread_stop(spe.reader_task);
+		kthread_stop(spe.reader_task);
 
-	/*TODO: We just stopped the thread, so maybe freeing already the buffer
-		is too early
+	/*
+	 * TODO: We just stopped the thread, so maybe freeing 
+	 * already the buffer is too early
 	*/
-	kfree(spe.base);
+	kfree(cinfo->buffer_base);
+	cinfo-> buffer_base = NULL;
 
 	spe.running = false;
 	return ret;
@@ -629,14 +748,14 @@ out_stop:
 
 static irqreturn_t spe_bw_irq_handler(int irq, void *dev)
 {
-	struct spe_ctrl *handle = dev;
+	struct core_info *cinfo = this_cpu_ptr(core_info);
 	
 	enum spe_bw_buf_fault_action act;
-	if (!handle->buf)
+	if (!cinfo->buffer_base)
 		return IRQ_NONE;
 	
 	pr_info("Irq called\n");
-	act = spe_bw_buf_fault_act_get(handle);
+	act = spe_bw_buf_fault_act_get(cinfo);
 	if (act == SPE_BW_BUF_FAULT_ACT_SPURIOUS)
 		return IRQ_NONE;
 	irq_called ++;
@@ -755,6 +874,7 @@ static struct platform_driver spe_bw_driver = {
 // Initialization function (called when the module is loaded)
 static int __init spe_guard_init(void)
 {
+	struct spe_ctrl *global = &spe;
 	u64 reg;
 	u64 reg_after;
 	int fld;
@@ -878,38 +998,51 @@ static int __init spe_guard_init(void)
 		counter_sz = 16;
 	}
 	pr_info("Countsize is %d\n",counter_sz);
+
+	memset(global, 0, sizeof(struct spe_ctrl));
+	zalloc_cpumask_var(&global->target_cpu, GFP_NOWAIT);
 		
+	global->filter_ld = true;
+	global->ts_enable = true;
+	global->pa_enable = true;
+	global->pct_enable = true;
+	global->exclude_user = false;
+	global->exclude_kernel = false;
+	global->cx_enable = true;
+	
+	global->period = SPE_BW_PERIOD;
+	global->advance = 0;
+
+	core_info = alloc_percpu(struct core_info);
+
 	spe_kobj = kobject_create_and_add("spe_regulator", kernel_kobj);
 	if (!spe_kobj){
 		ret = -ENOMEM;
 		goto failed_kobj;
 	}
-	
-	spe.filter_ld = true;
-	spe.ts_enable = true;
-	spe.pa_enable = true;
-	spe.pct_enable = true;
-	spe.exclude_user = false;
-	spe.exclude_kernel = false;
-	spe.cx_enable = true;
 
-	spe.period = SPE_BW_PERIOD;
-	spe.advance = 0;
+	if(sysfs_create_file(spe_kobj, &control_attr.attr)<0){
+		ret = -ENOMEM;
+		goto failed_file_creation;
+	}
+	if(sysfs_create_file(spe_kobj, &target_cpu_attr.attr)<0){
+		ret = -ENOMEM;
+		goto failed_file_creation;
+	}
+	if(sysfs_create_file(spe_kobj, &reader_cpu_attr.attr)<0){
+		ret = -ENOMEM;
+		goto failed_file_creation;
+	}
 
-	if(sysfs_create_file(spe_kobj, &control_attr.attr)<0)
-		return -ENOMEM;
-	if(sysfs_create_file(spe_kobj, &target_cpu_attr.attr)<0)
-		return -ENOMEM;
-	if(sysfs_create_file(spe_kobj, &reader_cpu_attr.attr)<0)
-		return -ENOMEM;
-
+	spe_bw_init_debugfs();
 	
 	ret = platform_driver_register(&spe_bw_driver);
 	if(ret)
 		return ret;
 	
 	return 0;  // Return 0 means success
-	platform_driver_unregister(&spe_bw_driver);
+	//platform_driver_unregister(&spe_bw_driver);
+	failed_file_creation:
 	sysfs_remove_file(spe_kobj, &control_attr.attr);
 	sysfs_remove_file(spe_kobj, &target_cpu_attr.attr);
 	sysfs_remove_file(spe_kobj, &reader_cpu_attr.attr);
@@ -945,4 +1078,64 @@ MODULE_AUTHOR("Alessandro Mandrile");
 [  437.581974] PMBSR_EL1 status: 0
 [  437.581986] SYS_PMBPTR_EL1 status: 0
 [  437.581987] SYS_PMBLIMITR_EL1 status: 0
+*/
+
+/*
+[79342.033330] Unable to handle kernel paging request at virtual address ffff936303c98048
+[79342.041709] Mem abort info:
+[79342.044691]   ESR = 0x96000044
+[79342.047886]   EC = 0x25: DABT (current EL), IL = 32 bits
+[79342.053396]   SET = 0, FnV = 0
+[79342.056610]   EA = 0, S1PTW = 0
+[79342.059895] Data abort info:
+[79342.062889]   ISV = 0, ISS = 0x00000044
+[79342.066867]   CM = 0, WnR = 1
+[79342.069942] swapper pgtable: 4k pages, 48-bit VAs, pgdp=000000013ff4d000
+[79342.076854] [ffff936303c98048] pgd=0000000000000000, p4d=0000000000000000
+[79342.083854] Internal error: Oops: 0000000096000044 [#1] PREEMPT SMP
+[79342.090293] Modules linked in: spe_bw(OE) bnep nvgpu(E) rtk_btusb btusb aes_ce_blk btrtl crypto_simd cryptd btbcm snd_soc_tegra186_asrc btintel snd_soc_tegra186_dspk snd_soc_tegra210_ope aes_ce_cipher snd_soc_tegra186_arad snd_soc_tegra210_iqc snd_hda_codec_hdmi snd_soc_tegra210_mvc snd_soc_tegra210_afc ghash_ce snd_soc_tegra210_dmic snd_soc_tegra210_adx snd_soc_tegra210_admaif sha2_ce snd_soc_tegra210_amx rtl8822ce sha256_arm64 snd_soc_tegra210_mixer snd_soc_tegra_pcm snd_soc_tegra210_i2s snd_soc_tegra210_sfc sha1_ce snd_soc_tegra_machine_driver mttcan snd_soc_tegra_utils cfg80211 snd_hda_tegra snd_soc_simple_card_utils pwm_fan snd_soc_spdif_tx snd_hda_codec can_dev snd_soc_tegra210_ahub fusb301 tegra_bpmp_thermal ina3221 tegra210_adma nvmap userspace_alert nv_imx219 snd_hda_core spi_tegra114 binfmt_misc ramoops reed_solomon ip_tables x_tables r8168 [last unloaded: spe_bw]
+[79342.170647] CPU: 1 PID: 6490 Comm: test_spe_regula Tainted: G           OE     5.10.216-no-spe #2
+[79342.179764] Hardware name: NVIDIA NVIDIA Orin Nano Developer Kit/Jetson, BIOS 5.0-36094991 04/24/2024
+[79342.189249] pstate: 60400009 (nZCv daif +PAN -UAO -TCO BTYPE=--)
+[79342.195437] pc : sysfs_store_control+0x100/0x2d0 [spe_bw]
+[79342.200984] lr : sysfs_store_control+0x100/0x2d0 [spe_bw]
+[79342.206529] sp : ffff800015cc3bd0
+[79342.209939] x29: ffff800015cc3bd0 x28: ffff4d5bd2eb9d80 
+[79342.215399] x27: ffff936303c98000 x26: ffff936303c98000 
+[79342.220862] x25: 0000000000000000 x24: 0000000000000000 
+[79342.226321] x23: ffffb9fa0f291520 x22: 0000000000000001 
+[79342.231777] x21: ffffb9fa2af38bc0 x20: 0000000000000000 
+[79342.237233] x19: ffffb9fa0f291500 x18: 0000000000000000 
+[79342.242696] x17: 0000000000000000 x16: ffffb9fa294ea3e0 
+[79342.248156] x15: 0000aaab127d19c0 x14: 0000000000000000 
+[79342.253615] x13: 0000000000000000 x12: 00000000000000c0 
+[79342.259075] x11: 0000000000000068 x10: 0000000000000068 
+[79342.264532] x9 : 0000000000000068 x8 : 0000000000000000 
+[79342.269993] x7 : ffffb9fa2b203260 x6 : ffffb9fa2af38370 
+[79342.275451] x5 : ffff936303c98000 x4 : ffff800015cc3ab0 
+[79342.280910] x3 : 000000000000002a x2 : 0000000000000000 
+[79342.286368] x1 : 0000000000000000 x0 : ffff4d5be3400000 
+[79342.291828] Call trace:
+[79342.294339]  sysfs_store_control+0x100/0x2d0 [spe_bw]
+[79342.299545]  kobj_attr_store+0x14/0x30
+[79342.303411]  sysfs_kf_write+0x60/0x70
+[79342.307172]  kernfs_fop_write_iter+0x12c/0x1c0
+[79342.311738]  new_sync_write+0xfc/0x1a0
+[79342.315593]  vfs_write+0x25c/0x390
+[79342.319079]  ksys_write+0x7c/0x110
+[79342.322578]  __arm64_sys_write+0x28/0x40
+[79342.326621]  el0_svc_common.constprop.0+0x80/0x1d0
+[79342.331543]  do_el0_svc+0x38/0xc0
+[79342.334960]  el0_svc+0x1c/0x30
+[79342.338093]  el0_sync_handler+0xa8/0xb0
+[79342.342036]  el0_sync+0x16c/0x180
+[79342.345447] Code: d53cd05a 8b1a029b d37ff800 94000349 (f9002760) 
+[79342.351736] ---[ end trace e65bdc3f77d3adeb ]---
+[79342.361456] Kernel panic - not syncing: Oops: Fatal exception
+[79342.367355] SMP: stopping secondary CPUs
+[79342.371806] Kernel Offset: 0x39fa19220000 from 0xffff800010000000
+[79342.378066] PHYS_OFFSET: 0xffffb2a540000000
+[79342.382365] CPU features: 0x08040006,4a00aa38
+[79342.386845] Memory Limit: none
+
 */
