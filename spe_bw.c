@@ -44,11 +44,17 @@
 //#define MY_READ_SYSREG(reg) 
 
 #define SPE_BW_PERIOD 4096
+#define WATERMARK_NUM 1
+#define WATERMARK_DEN 2
 
 struct spe_ctrl {
 	size_t size;
 	void *buf;
-	ssize_t limit;
+	void *base;
+	void* limit;
+	void* water_mark;
+
+	void *secondary_buf, *secondary_limit,*secondary_watermark;
 	ssize_t offset;
 	unsigned int active_buffer;
 	//interrupts = <0x01 0x05 0x04>;
@@ -166,6 +172,49 @@ static u64 spe_bw_fill_pmscr(void)
 	return reg;
 }
 
+static void spe_bw_manage_buffer(void *info){
+	unsigned int cpu = smp_processor_id();
+	struct spe_ctrl *spe_ctrl = (struct spe_ctrl*) info;
+	void* secondary_buf,*secondary_limit;
+	u64 reg;
+
+	pr_info("Management function triggered on cpu %d", cpu);
+	spe_bw_disable_and_drain_local();
+	reg = read_sysreg_s(SYS_PMBPTR_EL1);
+	
+	//Communicate limit
+	spe_ctrl->limit = (void*) reg;
+	//TODO: Missing check for syndrome
+	write_sysreg_s(0, SYS_PMBSR_EL1);
+
+	//Allocate secondary_buffer
+	secondary_buf = spe_ctrl->base + 
+			((spe_ctrl->active_buffer + 1)%2) * spe_ctrl->size/2;
+	memset(secondary_buf,0xff,spe_ctrl->size/2);
+	secondary_limit = secondary_buf + spe_ctrl->size/2;
+	// Ensure memset is completed
+	wmb();
+	write_sysreg_s(secondary_buf, SYS_PMBPTR_EL1);
+
+	reg = (u64)secondary_limit;
+	reg |= BIT(SYS_PMBLIMITR_EL1_E_SHIFT);
+	write_sysreg_s(reg, SYS_PMBLIMITR_EL1);
+	isb();
+
+	spe_ctrl->secondary_buf = secondary_buf;
+	spe_ctrl->secondary_watermark = secondary_buf 
+	+ (spe_ctrl->size/2)
+	* WATERMARK_NUM
+	/ WATERMARK_DEN;
+	wmb();
+	spe_ctrl->secondary_limit = secondary_limit;
+	// Set other flags and start sampling
+	reg = spe_bw_fill_pmscr();
+	write_sysreg_s(reg, SYS_PMSCR_EL1);
+	isb();
+	
+}
+
 static int process_record(void *base){
 	bool end = false;
 	void *header_addr = base;
@@ -205,7 +254,7 @@ static int process_record(void *base){
 				sprintf(string_short_buffer, "Timestamp packet(%d B), end\n", payload_size);
 				strncat(string_buffer, string_short_buffer
 				, 255 - strlen(string_buffer) - 1);
-				pr_info("%s",string_buffer);
+				pr_debug("%s",string_buffer);
 				header_match = true;
 				end = true;
 				break;
@@ -287,6 +336,13 @@ static void spe_enable_cpu(void *info)
 	struct spe_ctrl *s = info;
     	u64 reg = 0;
 	
+	s->buf = s->base;
+	s->limit = s->buf + s->size/2;
+	s->water_mark = s->buf + (s->size/2) * WATERMARK_NUM / WATERMARK_DEN;
+	pr_info("Buffer at address %llx\n", (u64)s->buf);
+
+	memset(s->buf, 0xff, s->size);
+	wmb();
 
 	enable_percpu_irq(s->irq, IRQ_TYPE_NONE);
 	pr_info("Enabling irq %d on cpu %d", s->irq, smp_processor_id());
@@ -351,40 +407,54 @@ static void spe_disable_cpu(void *info)
     pr_info("The IRQ had been called %d times", irq_called);
 }
 
-#define BUFFER_GUARD_NUM 3
-#define BUFFER_GUARD_DEN 4
 
 static int spe_reader(void *data)
 {
     struct spe_ctrl *s = data;
     int ret;
     u64 ones_mask = ~0x0; // This should make an all ones mask
-    bool watermark_hit = false;
 
     pr_info("SPE reader running on CPU %d\n", smp_processor_id());
 
 
-    while (s->offset < s->size || !kthread_should_stop() ) {
+    while (s->buf < READ_ONCE(s->limit) || !kthread_should_stop() ) {
 
 	smp_rmb();
 
-	if (s->offset < s->size && 
-		READ_ONCE(*(u64 *)(s->buf + s->offset + s->advance)) != ones_mask) {
+	if (s->buf < s->limit && 
+		READ_ONCE(*(u64 *)(s->buf + s->advance)) != ones_mask) {
 
-		pr_debug("SPE record at %lx\n", s->offset);
+		pr_debug("SPE record at %llx\n",(u64) s->buf);
 
-		ret = process_record(s->buf + s->offset);
+		ret = process_record(s->buf);
 		if(ret < 0){
 			pr_info("Unrecognised packet header: %x", (unsigned int)(-ret));
 		} else {
-			s->offset += 64;
-			if (!watermark_hit && s->offset >= s->size / 2 ){
-				watermark_hit = true;
+			s->buf += 64UL;
+
+			//With the equal comparison, it will only trigger once
+			if (s->buf == s->water_mark ){
+				pr_info("SPE reader:watermark hit\n");
+				if(0 != smp_call_function_single(s->target_cpu,
+					spe_bw_manage_buffer,
+					s, 0))
+				{				
+					pr_warn("error in calling " 
+						"spe_bw_manage_buffer");
+				}	
+				
 			}
 		}
 	}
 
-
+	if(s->buf == s->limit && 
+		READ_ONCE(s->secondary_buf) < READ_ONCE(s->secondary_limit))
+	{
+		s->active_buffer = (s->active_buffer + 1) % 2;
+		s->buf = s->secondary_buf;
+		s->limit = s->secondary_limit;
+		s->water_mark = s->secondary_watermark;
+	}
 	cpu_relax();
     }
     pr_info("SPE reader stopped on CPU %d\n", smp_processor_id());
@@ -394,10 +464,7 @@ static int spe_reader(void *data)
 static ssize_t sysfs_store_control(struct kobject *kobj,
 			     struct kobj_attribute *attr,
 			     const char *buf, size_t count)
-{
-	u64 init_mask = 0xFFFFFFFFFFFFFFFF;
-	unsigned int i;
-	
+{	
 	// Resetting extended packets counter;
 	extended_packets = 0;
 	if (sysfs_streq(buf, "start")) {
@@ -405,15 +472,11 @@ static ssize_t sysfs_store_control(struct kobject *kobj,
 			return count;
 
 		spe.size = 1<<(5+10+6);
-		spe.buf = kmalloc(spe.size, GFP_KERNEL);
-		if(!spe.buf){
+		spe.base = kmalloc(spe.size, GFP_KERNEL);
+		if(!spe.base){
 			return -ENOMEM;
 		}
-		pr_info("Buffer at address %llx\n", (u64)spe.buf);
-
-		for(i=0; i<(spe.size/sizeof(u64));i++){
-			((u64 *)spe.buf)[i] = init_mask;
-		}
+		
 		smp_wmb();
 		/* Start reader thread pinned */
 		spe.reader_task =
@@ -448,7 +511,7 @@ static ssize_t sysfs_store_control(struct kobject *kobj,
 		if (spe.reader_task)
 			kthread_stop(spe.reader_task);
 
-		kfree(spe.buf);
+		kfree(spe.base);
 
 		spe.running = false;
 
@@ -557,7 +620,7 @@ out_stop:
 	/*TODO: We just stopped the thread, so maybe freeing already the buffer
 		is too early
 	*/
-	kfree(spe.buf);
+	kfree(spe.base);
 
 	spe.running = false;
 	return ret;
@@ -876,3 +939,10 @@ MODULE_DESCRIPTION("SPE based Memeguard Implementation");
 MODULE_AUTHOR("Alessandro Mandrile");
 
 
+/*
+[  433.478452] SPE engine started on CPU 3
+[  433.478464] SPE started
+[  437.581974] PMBSR_EL1 status: 0
+[  437.581986] SYS_PMBPTR_EL1 status: 0
+[  437.581987] SYS_PMBLIMITR_EL1 status: 0
+*/
