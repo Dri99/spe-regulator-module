@@ -311,6 +311,8 @@ static int process_record(void *base){
 			//TODO: Make these masks readable
 			switch(header | 0x30){
 				case 0x71:
+				pr_debug("Timestamp addr:%llx",(u64)(header_addr+1));
+				pr_debug("TImestamp:%lld",spe_bw_get_record_timestamp(header_addr+1));
 				sprintf(string_short_buffer, "Timestamp packet(%d B), end\n", payload_size);
 				strncat(string_buffer, string_short_buffer
 				, 255 - strlen(string_buffer) - 1);
@@ -398,11 +400,11 @@ static void spe_enable_cpu(void *info)
 	struct core_info *cinfo = this_cpu_ptr(core_info);
 	smp_rmb();
 	pr_info("cpu %d : spe_enable",smp_processor_id());
-	pr_info("core_info address %llx",(u64)core_info);
-	pr_info("Buffer at address %llx\n", (u64)READ_ONCE(cinfo->buffer_base));
+	pr_debug("core_info address %llx",(u64)core_info);
+	pr_debug("Buffer at address %llx\n", (u64)READ_ONCE(cinfo->buffer_base));
 
 	enable_percpu_irq(s->irq, IRQ_TYPE_NONE);
-	pr_info("Enabling irq %d on cpu %d", s->irq, smp_processor_id());
+	pr_debug("Enabling irq %d on cpu %d", s->irq, smp_processor_id());
 	// Enable Filter by type
 	if(s->filter_ld)
 		reg |= BIT(SYS_PMSFCR_EL1_LD_SHIFT);
@@ -426,7 +428,7 @@ static void spe_enable_cpu(void *info)
 	write_sysreg_s(reg, SYS_PMBLIMITR_EL1);
 	isb();
 	reg = read_sysreg_s(SYS_PMBLIMITR_EL1);
-	pr_info("SYS_PMBLIMITR_EL1 status: %llx\n",reg);
+	pr_debug("SYS_PMBLIMITR_EL1 status: %llx\n",reg);
 	
 	
 	//Clear any interrupt state
@@ -438,7 +440,7 @@ static void spe_enable_cpu(void *info)
 	write_sysreg_s(reg, SYS_PMSCR_EL1);
     	
     	isb();
-	pr_info("SPE engine started on CPU %d\n",smp_processor_id());
+	pr_debug("SPE engine started on CPU %d\n",smp_processor_id());
 }
 
 static void spe_disable_cpu(void *info)
@@ -455,11 +457,11 @@ static void spe_disable_cpu(void *info)
     write_sysreg_s(read_sysreg_s(SYS_PMSCR_EL1) & ~1, SYS_PMSCR_EL1);
     isb();
     reg = read_sysreg_s(SYS_PMBSR_EL1);
-    pr_info("PMBSR_EL1 status: %llx\n",reg);
+    pr_debug("PMBSR_EL1 status: %llx\n",reg);
     reg = read_sysreg_s(SYS_PMBPTR_EL1);
-    pr_info("SYS_PMBPTR_EL1 status: %llx\n", reg);
-    pr_info("SYS_PMBLIMITR_EL1 status: %llx\n", reg);
-    pr_info("The IRQ had been called %d times", irq_called);
+    pr_debug("SYS_PMBPTR_EL1 status: %llx\n", reg);
+    pr_debug("SYS_PMBLIMITR_EL1 status: %llx\n", reg);
+    pr_debug("The IRQ had been called %d times", irq_called);
 }
 
 
@@ -471,7 +473,7 @@ static int spe_reader(void *data)
 	u64 ones_mask = ~0x0; // This should make an all ones mask
 	bool at_least_one_reading = true;
 
-	pr_info("SPE reader running on CPU %d\n", smp_processor_id());
+	pr_info("spe_reader(): Starting on CPU %d\n", smp_processor_id());
 
 
 	while (at_least_one_reading || !kthread_should_stop() ) {
@@ -502,7 +504,7 @@ static int spe_reader(void *data)
 
 					//With the equal comparison, it will only trigger once
 					if (cinfo->primary.buf == cinfo->primary.watermark ){
-						pr_info("SPE reader:watermark hit\n");
+						pr_debug("spe_reader():watermark hit\n");
 						if(0 != smp_call_function_single(cpu,
 							spe_bw_manage_buffer,
 							s, 0))
@@ -533,7 +535,7 @@ static int spe_reader(void *data)
 		}
 		cpu_relax();
 	}
-	pr_info("SPE reader stopped on CPU %d\n", smp_processor_id());
+	pr_info("spe_reader(): stopped on CPU %d\n", smp_processor_id());
 	return 0;
 }
 
@@ -608,12 +610,13 @@ static ssize_t sysfs_store_control(struct kobject *kobj,
 		wake_up_process(spe.reader_task);
 
 		/* Enable SPE on target CPU */
+		// TODO: remove wait true and change with semaphore
 		for_each_cpu(i, spe.target_cpu){
 			smp_call_function_single(i,
 					spe_enable_cpu,
 					&spe, 1);
 		}
-
+		
 		spe.running = true;
 		pr_info("SPE started\n");
 	}
@@ -640,9 +643,9 @@ static ssize_t sysfs_store_control(struct kobject *kobj,
 
 		pr_info("sysfs_store_control: SPE stopped\n");
 		pr_debug("sysfs_store_control: Found %d extended packets\n",extended_packets);	
-    }
+	}
 
-    return count;
+	return count;
 }
 
 static ssize_t sysfs_store_target_cpu(struct kobject *kobj,
@@ -902,62 +905,62 @@ static int __init spe_guard_init(void)
 
 	//reg = read_sysreg_s(SYS_CPUECTLR_EL1);
 	__asm__ volatile ("mrs %0, S3_0_C15_C1_4": "=r"(reg)::);
-	pr_info("CPUECTLR_EL1=%llx/n",reg);
+	pr_debug("CPUECTLR_EL1=%llx/n",reg);
 
 	reg = read_sysreg_s(SYS_CNTFRQ_EL0);
-	pr_info("CNTFRQ_EL0=%llu/n",reg);
+	pr_debug("CNTFRQ_EL0=%llu/n",reg);
 
-	pr_info("Sleeping 100ms...");
+	pr_debug("Sleeping 100ms...");
 	//reg = read_sysreg_s(cntpct_el0);
 	asm volatile("mrs %0, cntpct_el0" : "=r" (reg));
 	mdelay(100);
 	//reg = read_sysreg_s(SYS_CNTPCT_EL0) - reg;
 	asm volatile("mrs %0, cntpct_el0" : "=r" (reg_after));
-	pr_info("Slept for %llu clocks", reg_after - reg);
+	pr_debug("Slept for %llu clocks", reg_after - reg);
 	
 	reg = read_sysreg_s(SYS_PMBIDR_EL1);
-	pr_info("SYS_PMBIDR_EL1=%08llx/n",reg);
+	pr_debug("SYS_PMBIDR_EL1=%08llx/n",reg);
 	reg = read_sysreg_s(SYS_PMBIDR_EL1);
 	if (reg & BIT(SYS_PMBIDR_EL1_P_SHIFT)) {
-		pr_info("profiling buffer owned by higher exception level\n");
+		pr_warn("profiling buffer owned by higher exception level\n");
 	}
 	else {
-		pr_info("profiling available\n");
+		pr_debug("profiling available\n");
 	}
 
 	/* Minimum alignment. If it's out-of-range, then fail the probe */
 	fld = reg >> SYS_PMBIDR_EL1_ALIGN_SHIFT & SYS_PMBIDR_EL1_ALIGN_MASK;
-	pr_info("Minimum alignment: %d\n", 1 << fld);
+	pr_debug("Minimum alignment: %d\n", 1 << fld);
 
 	/* It's now safe to read PMSIDR and figure out what we've got */
-	pr_info("Reading PMSIDR\n");
+	pr_debug("Reading PMSIDR\n");
 	reg = read_sysreg_s(SYS_PMSIDR_EL1);
-	pr_info("Entire PMSIDR: 0x%08llx\n", reg);
+	pr_debug("Entire PMSIDR: 0x%08llx\n", reg);
 
 	if (BIT_GET(SYS_PMSIDR_EL1_FE, reg))
-		pr_info("FE bit set\n");
+		pr_debug("FE bit set\n");
 
 	// if (BIT_GET(SYS_PMSIDR_EL1_FnE, reg))
 	// 	pr_info("FnE bit set\n");
 
 	if (BIT_GET(SYS_PMSIDR_EL1_FT, reg))
-		pr_info("FT bit set\n");
+		pr_debug("FT bit set\n");
 
 	if (BIT_GET(SYS_PMSIDR_EL1_FL, reg))
-		pr_info("FL bit set\n");
+		pr_debug("FL bit set\n");
 
 	if (BIT_GET(SYS_PMSIDR_EL1_ARCHINST, reg))
-		pr_info("ARCHINST bit set\n");
+		pr_debug("ARCHINST bit set\n");
 	else
-			pr_info("ARCHINST bit not set\n");
+			pr_debug("ARCHINST bit not set\n");
 
 	if (BIT_GET(SYS_PMSIDR_EL1_LDS, reg))
-		pr_info("LDS bit set\n");
+		pr_debug("LDS bit set\n");
 
 	if (BIT_GET(SYS_PMSIDR_EL1_ERND, reg))
-		pr_info("ERND bit set\n");
+		pr_debug("ERND bit set\n");
 	else
-		pr_info("ERND bit not set\n");
+		pr_debug("ERND bit not set\n");
 
 	/* This field has a spaced out encoding, so just use a look-up */
 	fld = FIELD_GET(SYS_PMSIDR_EL1_INTERVAL_MASK<<SYS_PMSIDR_EL1_INTERVAL_SHIFT, reg);
@@ -988,13 +991,13 @@ static int __init spe_guard_init(void)
 	case 8:
 		interval = 4096;
 	}
-	pr_info("Interval=%d\n",interval);
+	pr_debug("Interval=%d\n",interval);
 
 	/* Maximum record size. If it's out-of-range, then fail the probe */
 
 	fld = FIELD_GET_LOCAL(SYS_PMSIDR_EL1_MAXSIZE, reg);
 	max_record_sz = 1 << fld;
-	pr_info("Max record size: %d\n", max_record_sz);
+	pr_debug("Max record size: %d\n", max_record_sz);
 
 
 	fld = FIELD_GET_LOCAL(SYS_PMSIDR_EL1_COUNTSIZE, reg);
@@ -1008,7 +1011,7 @@ static int __init spe_guard_init(void)
 	case 3:
 		counter_sz = 16;
 	}
-	pr_info("Countsize is %d\n",counter_sz);
+	pr_debug("Countsize is %d\n",counter_sz);
 
 	memset(global, 0, sizeof(struct spe_ctrl));
 	zalloc_cpumask_var(&global->target_cpu, GFP_NOWAIT);
@@ -1081,72 +1084,3 @@ module_exit(spe_guard_exit);
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("SPE based Memeguard Implementation");
 MODULE_AUTHOR("Alessandro Mandrile");
-
-
-/*
-[  433.478452] SPE engine started on CPU 3
-[  433.478464] SPE started
-[  437.581974] PMBSR_EL1 status: 0
-[  437.581986] SYS_PMBPTR_EL1 status: 0
-[  437.581987] SYS_PMBLIMITR_EL1 status: 0
-*/
-
-/*
-[79342.033330] Unable to handle kernel paging request at virtual address ffff936303c98048
-[79342.041709] Mem abort info:
-[79342.044691]   ESR = 0x96000044
-[79342.047886]   EC = 0x25: DABT (current EL), IL = 32 bits
-[79342.053396]   SET = 0, FnV = 0
-[79342.056610]   EA = 0, S1PTW = 0
-[79342.059895] Data abort info:
-[79342.062889]   ISV = 0, ISS = 0x00000044
-[79342.066867]   CM = 0, WnR = 1
-[79342.069942] swapper pgtable: 4k pages, 48-bit VAs, pgdp=000000013ff4d000
-[79342.076854] [ffff936303c98048] pgd=0000000000000000, p4d=0000000000000000
-[79342.083854] Internal error: Oops: 0000000096000044 [#1] PREEMPT SMP
-[79342.090293] Modules linked in: spe_bw(OE) bnep nvgpu(E) rtk_btusb btusb aes_ce_blk btrtl crypto_simd cryptd btbcm snd_soc_tegra186_asrc btintel snd_soc_tegra186_dspk snd_soc_tegra210_ope aes_ce_cipher snd_soc_tegra186_arad snd_soc_tegra210_iqc snd_hda_codec_hdmi snd_soc_tegra210_mvc snd_soc_tegra210_afc ghash_ce snd_soc_tegra210_dmic snd_soc_tegra210_adx snd_soc_tegra210_admaif sha2_ce snd_soc_tegra210_amx rtl8822ce sha256_arm64 snd_soc_tegra210_mixer snd_soc_tegra_pcm snd_soc_tegra210_i2s snd_soc_tegra210_sfc sha1_ce snd_soc_tegra_machine_driver mttcan snd_soc_tegra_utils cfg80211 snd_hda_tegra snd_soc_simple_card_utils pwm_fan snd_soc_spdif_tx snd_hda_codec can_dev snd_soc_tegra210_ahub fusb301 tegra_bpmp_thermal ina3221 tegra210_adma nvmap userspace_alert nv_imx219 snd_hda_core spi_tegra114 binfmt_misc ramoops reed_solomon ip_tables x_tables r8168 [last unloaded: spe_bw]
-[79342.170647] CPU: 1 PID: 6490 Comm: test_spe_regula Tainted: G           OE     5.10.216-no-spe #2
-[79342.179764] Hardware name: NVIDIA NVIDIA Orin Nano Developer Kit/Jetson, BIOS 5.0-36094991 04/24/2024
-[79342.189249] pstate: 60400009 (nZCv daif +PAN -UAO -TCO BTYPE=--)
-[79342.195437] pc : sysfs_store_control+0x100/0x2d0 [spe_bw]
-[79342.200984] lr : sysfs_store_control+0x100/0x2d0 [spe_bw]
-[79342.206529] sp : ffff800015cc3bd0
-[79342.209939] x29: ffff800015cc3bd0 x28: ffff4d5bd2eb9d80 
-[79342.215399] x27: ffff936303c98000 x26: ffff936303c98000 
-[79342.220862] x25: 0000000000000000 x24: 0000000000000000 
-[79342.226321] x23: ffffb9fa0f291520 x22: 0000000000000001 
-[79342.231777] x21: ffffb9fa2af38bc0 x20: 0000000000000000 
-[79342.237233] x19: ffffb9fa0f291500 x18: 0000000000000000 
-[79342.242696] x17: 0000000000000000 x16: ffffb9fa294ea3e0 
-[79342.248156] x15: 0000aaab127d19c0 x14: 0000000000000000 
-[79342.253615] x13: 0000000000000000 x12: 00000000000000c0 
-[79342.259075] x11: 0000000000000068 x10: 0000000000000068 
-[79342.264532] x9 : 0000000000000068 x8 : 0000000000000000 
-[79342.269993] x7 : ffffb9fa2b203260 x6 : ffffb9fa2af38370 
-[79342.275451] x5 : ffff936303c98000 x4 : ffff800015cc3ab0 
-[79342.280910] x3 : 000000000000002a x2 : 0000000000000000 
-[79342.286368] x1 : 0000000000000000 x0 : ffff4d5be3400000 
-[79342.291828] Call trace:
-[79342.294339]  sysfs_store_control+0x100/0x2d0 [spe_bw]
-[79342.299545]  kobj_attr_store+0x14/0x30
-[79342.303411]  sysfs_kf_write+0x60/0x70
-[79342.307172]  kernfs_fop_write_iter+0x12c/0x1c0
-[79342.311738]  new_sync_write+0xfc/0x1a0
-[79342.315593]  vfs_write+0x25c/0x390
-[79342.319079]  ksys_write+0x7c/0x110
-[79342.322578]  __arm64_sys_write+0x28/0x40
-[79342.326621]  el0_svc_common.constprop.0+0x80/0x1d0
-[79342.331543]  do_el0_svc+0x38/0xc0
-[79342.334960]  el0_svc+0x1c/0x30
-[79342.338093]  el0_sync_handler+0xa8/0xb0
-[79342.342036]  el0_sync+0x16c/0x180
-[79342.345447] Code: d53cd05a 8b1a029b d37ff800 94000349 (f9002760) 
-[79342.351736] ---[ end trace e65bdc3f77d3adeb ]---
-[79342.361456] Kernel panic - not syncing: Oops: Fatal exception
-[79342.367355] SMP: stopping secondary CPUs
-[79342.371806] Kernel Offset: 0x39fa19220000 from 0xffff800010000000
-[79342.378066] PHYS_OFFSET: 0xffffb2a540000000
-[79342.382365] CPU features: 0x08040006,4a00aa38
-[79342.386845] Memory Limit: none
-
-*/
