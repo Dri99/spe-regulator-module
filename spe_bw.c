@@ -30,6 +30,7 @@
 #include <linux/printk.h>
 #include <linux/slab.h>
 #include <linux/smp.h>
+#include <asm/unaligned.h>
 #include <linux/vmalloc.h>
 
 #include <asm/barrier.h>
@@ -127,6 +128,8 @@ static unsigned int extended_packets = 0;
 
 static struct kobject *spe_kobj;
 
+unsigned int irq_called = 0;
+unsigned int spe_bw_management_called[NR_CPUS];
 static char string_buffer[255];
 static char string_short_buffer[255];
 //struct kobj_attribute etx_attr = __ATTR(etx_value, 0660, sysfs_show, sysfs_store);
@@ -209,6 +212,16 @@ static u64 spe_bw_fill_pmscr(void)
 	return reg;
 }
 
+static u64 spe_bw_get_record_timestamp(void *payload_addr){
+	u64 timestamp;
+	if(likely((payload_addr & (0x7U)) == 0U)){
+		timestamp = (u64 *)payload_addr;
+	}else{
+		timestamp = get_unaligned((u64 *)payload_addr);
+	}
+	return timestamp;
+}
+
 static void spe_bw_manage_buffer(void *info){
 	unsigned int cpu = smp_processor_id();
 	struct spe_ctrl *spe_ctrl = (struct spe_ctrl*) info;
@@ -216,13 +229,20 @@ static void spe_bw_manage_buffer(void *info){
 	void* secondary_buf,*secondary_limit;
 	u64 reg;
 
+	spe_bw_management_called[cpu]++;
 	pr_info("Management function triggered on cpu %d", cpu);
 	spe_bw_disable_and_drain_local();
 	reg = read_sysreg_s(SYS_PMBPTR_EL1);
 	
 	//Communicate limit
 	cinfo->primary.limit = (void*) reg;
+	
+	reg = read_sysreg_s(SYS_PMBSR_EL1);
 	//TODO: Missing check for syndrome
+	if(reg != 0){
+		pr_warn("spe_bw_manage_buffer(): SYS_PMBSR_EL1: %llx",reg);
+	} 
+
 	write_sysreg_s(0, SYS_PMBSR_EL1);
 
 	//Allocate secondary_buffer
@@ -421,7 +441,6 @@ static void spe_enable_cpu(void *info)
 	pr_info("SPE engine started on CPU %d\n",smp_processor_id());
 }
 
-unsigned int irq_called = 0;
 static void spe_disable_cpu(void *info)
 {
     /* Disable SPE */
@@ -459,7 +478,7 @@ static int spe_reader(void *data)
 		at_least_one_reading = false;
 		
 		for_each_cpu(cpu, s->target_cpu){
-			struct core_info * cinfo = this_cpu_ptr(core_info);
+			struct core_info * cinfo = per_cpu_ptr(core_info,cpu);
 			/*
 			 * spe_buf::limit can change out of the control of 
 			 * current thread's control.
@@ -532,9 +551,7 @@ static ssize_t sysfs_store_control(struct kobject *kobj,
 		
 		spe.size = BUFFER_SIZE;
 		for_each_cpu(i, spe.target_cpu){
-			struct core_info *cinfo = this_cpu_ptr(core_info);
-			pr_info("Executing sysfs_store_control for cpu %d",i);
-			pr_info("core_info address %llx",(u64)core_info);
+			struct core_info *cinfo = per_cpu_ptr(core_info,i);
 			// Allocate 2 buffers of size BUFFER_SIZE per core
 			cinfo->buffer_base = kmalloc(spe.size * 2, GFP_KERNEL);
 			if(!cinfo->buffer_base)
@@ -567,12 +584,10 @@ static ssize_t sysfs_store_control(struct kobject *kobj,
 			};
 
 			cinfo->active_buffer = 0;
-			pr_info("cinfo->buffer_base: %llx",(u64)cinfo->buffer_base);
-			pr_info("cinfo->primary.buf: %llx",(u64)cinfo->primary.buf);
 		}
 		if(alloc_failed){
 			for_each_cpu(i, spe.target_cpu){
-				struct core_info *cinfo = this_cpu_ptr(core_info);
+				struct core_info *cinfo = per_cpu_ptr(core_info,i);
 				kfree(cinfo-> buffer_base);
 				cinfo-> buffer_base = NULL;
 			}
@@ -580,6 +595,7 @@ static ssize_t sysfs_store_control(struct kobject *kobj,
 		}
 		
 		smp_wmb();
+		memset(spe_bw_management_called,0,sizeof(spe_bw_management_called));
 		/* Start reader thread pinned */
 		spe.reader_task =
 			kthread_create(spe_reader, &spe, "spe_reader");
@@ -592,9 +608,11 @@ static ssize_t sysfs_store_control(struct kobject *kobj,
 		wake_up_process(spe.reader_task);
 
 		/* Enable SPE on target CPU */
-		smp_call_function_many(spe.target_cpu,
+		for_each_cpu(i, spe.target_cpu){
+			smp_call_function_single(i,
 					spe_enable_cpu,
 					&spe, 1);
+		}
 
 		spe.running = true;
 		pr_info("SPE started\n");
@@ -613,22 +631,15 @@ static ssize_t sysfs_store_control(struct kobject *kobj,
 			kthread_stop(spe.reader_task);
 
 		for_each_cpu(i, spe.target_cpu){
-			struct core_info *cinfo = this_cpu_ptr(core_info);
+			struct core_info *cinfo = per_cpu_ptr(core_info,i);
 			kfree(cinfo-> buffer_base);
 			cinfo-> buffer_base = NULL;
 		}
 
 		spe.running = false;
 
-		pr_info("SPE stopped\n");
-		for_each_cpu(i, spe.target_cpu){
-			struct core_info *cinfo = this_cpu_ptr(core_info);
-			pr_info("Executing sysfs_store_control stop for cpu %d",i);
-			pr_info("cinfo->buffer_base: %llx",(u64)cinfo->buffer_base);
-			pr_info("cinfo->primary.buf: %llx",(u64)cinfo->primary.buf);
-		}
-		pr_info("Found %d extended packets\n",extended_packets);
-	
+		pr_info("sysfs_store_control: SPE stopped\n");
+		pr_debug("sysfs_store_control: Found %d extended packets\n",extended_packets);	
     }
 
     return count;
