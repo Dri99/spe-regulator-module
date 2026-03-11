@@ -214,8 +214,8 @@ static u64 spe_bw_fill_pmscr(void)
 
 static u64 spe_bw_get_record_timestamp(void *payload_addr){
 	u64 timestamp;
-	if(likely((payload_addr & (0x7U)) == 0U)){
-		timestamp = (u64 *)payload_addr;
+	if(likely(((u64)payload_addr & (0x7U)) == 0U)){
+		timestamp = *(u64 *)payload_addr;
 	}else{
 		timestamp = get_unaligned((u64 *)payload_addr);
 	}
@@ -626,9 +626,10 @@ static ssize_t sysfs_store_control(struct kobject *kobj,
 		if (!spe.running)
 			return count;
 
-		smp_call_function_many(spe.target_cpu,
-					spe_disable_cpu,
+		for_each_cpu(i, spe.target_cpu){
+			smp_call_function_single(i, spe_disable_cpu,
 					&spe, 1);
+		}
 
 		if (spe.reader_task)
 			kthread_stop(spe.reader_task);
