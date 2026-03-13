@@ -37,8 +37,16 @@
 #include <asm/cpufeature.h>
 #include <asm/mmu.h>
 #include <asm/sysreg.h>
+
 #define STR_BUFFER_LEN 255
 //TODO: this should be a module parameter
+
+#define BUFFER_SIZE (1 << 21)
+#define NUM_STATS_RECORDS (2*2^20ULL)
+#define SPE_BW_PERIOD 256
+#define WATERMARK_NUM 1
+#define WATERMARK_DEN 2
+#define CONFIG_PERF_OPTIMISED 1
 #define PKT_PAYLOAD_SZ_MASK (0x3)
 #define PKT_PAYLOAD_SZ_SHIFT (4)
 
@@ -54,20 +62,29 @@ do {				\
 	var1 = var2;		\
 	var2 = temp;		\
 }while(0);
+#if CONFIG_PERF_OPTIMISED > 0
+#define pr_info_concat(_str,...)				\
+({do {} while(0);})
+#else
 #define pr_info_concat(_str,...) 				\
 ({								\
 	sprintf(string_short_buffer, _str, __VA_ARGS__);	\
 	strncat(string_buffer, string_short_buffer,		\
 		 STR_BUFFER_LEN - strlen(string_buffer) - 1);	\
 })
+#endif
 
-//TODO: this should be a module parameter
-#define BUFFER_SIZE (1 << 21)
-#define SPE_BW_PERIOD 4096
-#define WATERMARK_NUM 1
-#define WATERMARK_DEN 2
+#if CONFIG_PERF_OPTIMISED == 0
+//To Enable pr_debug, just enable DEBUG
+#define PR_TRACE(...) pr_debug(__VA_ARGS__)
+#define PR_DEBUG(...) pr_info(__VA_ARGS__)
+#elif CONFIG_PERF_OPTIMISED > 0
+#define PR_TRACE(...) pr_debug(__VA_ARGS__)
+#define PR_DEBUG(...) pr_debug(__VA_ARGS__)
+#endif
 
 #define OTHER_BUFFER(active_one) ((active_one + 1) % 2)
+
 /**************************************************************************
  * Public Types
  **************************************************************************/
@@ -188,8 +205,10 @@ static struct kobject *spe_kobj;
 
 unsigned int irq_called = 0;
 unsigned int spe_bw_management_called[NR_CPUS];
+#if CONFIG_PERF_OPTIMISED < 1
 static char string_buffer[STR_BUFFER_LEN];
 static char string_short_buffer[STR_BUFFER_LEN];
+#endif
 //struct kobj_attribute etx_attr = __ATTR(etx_value, 0660, sysfs_show, sysfs_store);
 /**************************************************************************
  * Local Function Prototypes
@@ -288,7 +307,7 @@ static void spe_bw_manage_buffer(void *info){
 	u64 reg;
 
 	spe_bw_management_called[cpu]++;
-	pr_info("Management function triggered on cpu %d", cpu);
+	pr_debug("Management function triggered on cpu %d", cpu);
 	spe_bw_disable_and_drain_local();
 	reg = read_sysreg_s(SYS_PMBPTR_EL1);
 	
@@ -339,11 +358,13 @@ static int process_record(void *base){
 	u8 header;
 	unsigned int payload_size = 0;
 	unsigned int header_size = 0;
-	unsigned int packets_found = 0;
 	u64 timestamp;
 	bool header_match;
+#if CONFIG_PERF_OPTIMISED == 0
+	int i;
+	unsigned int packets_found = 0;
 	string_buffer[0] = '\0';
-
+#endif
 	while(header_addr < (base + 64UL) && !end){
 		header = READ_ONCE(*(u8 *)header_addr);
 		header_size = 1;
@@ -371,7 +392,9 @@ static int process_record(void *base){
 			//Do Nothing
 				break;
 			case PKT_END:
-				pr_debug("%s",string_buffer);
+#if CONFIG_PERF_OPTIMISED == 0
+				PR_TRACE("%s",string_buffer);
+#endif
 				pr_debug("End packet\n");
 				end = true;
 				break;
@@ -380,7 +403,9 @@ static int process_record(void *base){
 				pr_debug("Timestamp addr:%llx",(u64)(header_addr+1));
 				pr_debug("TImestamp:%lld", timestamp);
 				pr_info_concat("Timestamp packet(%d B), end\n", payload_size);
-				pr_debug("%s",string_buffer);
+#if CONFIG_PERF_OPTIMISED == 0
+				PR_TRACE("%s",string_buffer);
+#endif
 				end = true;
 				break;
 			case PKT_EVENTS_1B:
@@ -443,16 +468,28 @@ static int process_record(void *base){
 				break;
 			}
 		if(!header_match){
+#if CONFIG_PERF_OPTIMISED == 0
+			PR_TRACE("%s",string_buffer);
+			string_buffer[0] = '\0';
+			for(i=0; i<64;i++){
+				pr_info_concat("%02X ",((u8*)base)[i] );
+			}
+			PR_DEBUG("%s\n", string_buffer);
+#endif				
 			pr_debug("Unknown packet (%d B)(%x)", payload_size,header);
 			return -((int)header);
 		}
+#if CONFIG_PERF_OPTIMISED == 0
 		// This counts all non-padding packets
 		if(header != 0x00){
 			packets_found++;		
 		}
+#endif
 		header_addr = header_addr + payload_size + header_size;
 	}
-	pr_debug("Found %d packets\n", packets_found);
+#if CONFIG_PERF_OPTIMISED < 1
+	PR_DEBUG("Found %d packets\n", packets_found);
+#endif
 	return 0;
 }
 
@@ -521,11 +558,11 @@ static void spe_disable_cpu(void *info)
     write_sysreg_s(read_sysreg_s(SYS_PMSCR_EL1) & ~1, SYS_PMSCR_EL1);
     isb();
     reg = read_sysreg_s(SYS_PMBSR_EL1);
-    pr_debug("PMBSR_EL1 status: %llx\n",reg);
+    PR_DEBUG("PMBSR_EL1 status: %llx\n",reg);
     reg = read_sysreg_s(SYS_PMBPTR_EL1);
-    pr_debug("SYS_PMBPTR_EL1 status: %llx\n", reg);
-    pr_debug("SYS_PMBLIMITR_EL1 status: %llx\n", reg);
-    pr_debug("The IRQ had been called %d times", irq_called);
+    PR_DEBUG("SYS_PMBPTR_EL1 status: %llx\n", reg);
+    PR_DEBUG("SYS_PMBLIMITR_EL1 status: %llx\n", pmblimitr);
+    PR_DEBUG("The IRQ had been called %d times", irq_called);
 }
 
 
