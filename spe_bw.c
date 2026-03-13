@@ -37,6 +37,10 @@
 #include <asm/cpufeature.h>
 #include <asm/mmu.h>
 #include <asm/sysreg.h>
+#define STR_BUFFER_LEN 255
+//TODO: this should be a module parameter
+#define PKT_PAYLOAD_SZ_MASK (0x3)
+#define PKT_PAYLOAD_SZ_SHIFT (4)
 
 #define BIT_GET(_fld, _reg) (_reg & BIT(_fld ## _SHIFT))
 #define BIT_SET(_fld) (_reg & BIT(_fld ## _SHIFT))
@@ -50,7 +54,12 @@ do {				\
 	var1 = var2;		\
 	var2 = temp;		\
 }while(0);
-//#define MY_READ_SYSREG(reg) 
+#define pr_info_concat(_str,...) 				\
+({								\
+	sprintf(string_short_buffer, _str, __VA_ARGS__);	\
+	strncat(string_buffer, string_short_buffer,		\
+		 STR_BUFFER_LEN - strlen(string_buffer) - 1);	\
+})
 
 //TODO: this should be a module parameter
 #define BUFFER_SIZE (1 << 21)
@@ -62,6 +71,62 @@ do {				\
 /**************************************************************************
  * Public Types
  **************************************************************************/
+ /*
+ * Unreachable codes are inserted to allow optimisations from the compiler,
+ * since it will be able to group together similar codes
+*/
+enum spe_header_type
+{
+	PKT_PADDING = 		0x00,
+	PKT_END = 		0x01,
+	PKT_TIMESTAMP = 	0x71,
+	PKT_EVENTS_1B = 	0x42,
+	PKT_EVENTS_2B = 	0x52,
+	PKT_EVENTS_4B = 	0x62,
+	PKT_EVENTS_8B = 	0x72,
+	PKT_DATA_SOURCE_1B = 	0x43,
+	PKT_DATA_SOURCE_2B = 	0x53,
+	// Unreachable
+	PKT_DATA_SOURCE_4B = 	0x63,
+	// Unreachable
+	PKT_DATA_SOURCE_RES = 	0x73,
+	PKT_CONTEXT_EL1 = 	0x64,
+	PKT_CONTEXT_EL2 = 	0x65,
+	// Unreachable
+	PKT_CONTEXT_RES0 = 	0x66,
+	// Unreachable
+	PKT_CONTEXT_RES1 = 	0x67,
+	PKT_OP_TYPE_OTHER = 	0x48,
+	PKT_OP_TYPE_LDST = 	0x49,
+	PKT_OP_TYPE_BRANCH = 	0x4A,
+	PKT_OP_TYPE_RES0 = 	0x4B,	
+	PKT_ADDR_SH_PC = 	0xB0,
+	PKT_ADDR_SH_B_TARGET = 	0xB1,
+	PKT_ADDR_SH_ACC_VA = 	0xB2,
+	PKT_ADDR_SH_ACC_PA =	0xB3,
+	// Unreachable
+	PKT_ADDR_SH_RES0 =	0xB4,
+	// Unreachable
+	PKT_ADDR_SH_RES1 =	0xB5,
+	PKT_ADDR_SH_IMPL_DEF_0 =0xB6,
+	PKT_ADDR_SH_IMPL_DEF_1 =0xB7,
+	PKT_CNT_SH_TOT_LAT = 	0x98,
+	PKT_CNT_SH_ISSUE_LAT = 	0x99,
+	PKT_CNT_SH_XLAT = 	0x9A,
+	// Unreachable
+	PKT_CNT_SH_RES0 =	0x9B,
+	// Unreachable
+	PKT_CNT_SH_RES1 =	0x9C,
+	// Unreachable
+	PKT_CNT_SH_RES2 =	0x9D,
+	PKT_CNT_SH_IMPL_DEF_0 =	0x9E,
+	PKT_CNT_SH_IMPL_DEF_1 =	0x9F,
+	PKT_LONG_GENERIC_0 =	0x20,
+	PKT_LONG_GENERIC_1 =	0x21,
+	PKT_LONG_GENERIC_2 =	0x22,
+	PKT_LONG_GENERIC_3 =	0x23,
+	PKT_UNINITIALISED =	0xFF,
+};
 
 struct spe_buffer {
 	void *buf;
@@ -84,13 +149,6 @@ struct core_info{
 
 struct spe_ctrl {
 	size_t size;
-	// void *buf;
-	// void *base;
-	// void* limit;
-	// void* water_mark;
-
-	// void *secondary_buf, *secondary_limit,*secondary_watermark;
-	// unsigned int active_buffer;
 	//interrupts = <0x01 0x05 0x04>;
 	//		<Type(PPI) Number TriggerType(active high level sensitive)>
 	int irq;
@@ -130,8 +188,8 @@ static struct kobject *spe_kobj;
 
 unsigned int irq_called = 0;
 unsigned int spe_bw_management_called[NR_CPUS];
-static char string_buffer[255];
-static char string_short_buffer[255];
+static char string_buffer[STR_BUFFER_LEN];
+static char string_short_buffer[STR_BUFFER_LEN];
 //struct kobj_attribute etx_attr = __ATTR(etx_value, 0660, sysfs_show, sysfs_store);
 /**************************************************************************
  * Local Function Prototypes
@@ -282,6 +340,7 @@ static int process_record(void *base){
 	unsigned int payload_size = 0;
 	unsigned int header_size = 0;
 	unsigned int packets_found = 0;
+	u64 timestamp;
 	bool header_match;
 	string_buffer[0] = '\0';
 
@@ -291,96 +350,101 @@ static int process_record(void *base){
 		payload_size = 0;
 		if(header < 0x20){
 			pr_debug("Header-only: %x\n", header);
-			if(header == 0x01){
-				pr_info("%s",string_buffer);
-				pr_info("End packet\n");
-				end = true;
-			}
-
+			header_size = 1;
+			payload_size = 0;
 		}else if(header < 0x40){
 			pr_debug("Extended:");
-			header_size = 2;
 			header = *(u8 *)(header_addr+1U);
-			//TODO: make this readable
-			payload_size = 1 << (header >> 4 & 0x3U);
+			header_size = 2;
+			payload_size = 1 << FIELD_GET_LOCAL(PKT_PAYLOAD_SZ,
+								header);
 			
-			extended_packets++;
 		}else{
-			payload_size = 1 << (header >> 4 & 0x3U);
-			header_match = false;
-			//TODO: Make these masks readable
-			switch(header | 0x30){
-				case 0x71:
-				pr_debug("Timestamp addr:%llx",(u64)(header_addr+1));
-				pr_debug("TImestamp:%lld",spe_bw_get_record_timestamp(header_addr+1));
-				sprintf(string_short_buffer, "Timestamp packet(%d B), end\n", payload_size);
-				strncat(string_buffer, string_short_buffer
-				, 255 - strlen(string_buffer) - 1);
-				pr_debug("%s",string_buffer);
+			header_size = 1;
+			payload_size = 1 << FIELD_GET_LOCAL(PKT_PAYLOAD_SZ,
+								header);
+		}
+
 				header_match = true;
+		switch(header){
+			case PKT_PADDING:
+			//Do Nothing
+				break;
+			case PKT_END:
+				pr_debug("%s",string_buffer);
+				pr_debug("End packet\n");
 				end = true;
 				break;
-				case 0x72:
-				sprintf(string_short_buffer, "Events packet (%d B), ", payload_size);
-				strncat(string_buffer, string_short_buffer
-				, 255 - strlen(string_buffer) - 1);
-				
-				header_match = true;
+			case PKT_TIMESTAMP:
+				timestamp = spe_bw_get_record_timestamp(header_addr+1);
+				pr_debug("Timestamp addr:%llx",(u64)(header_addr+1));
+				pr_debug("TImestamp:%lld", timestamp);
+				pr_info_concat("Timestamp packet(%d B), end\n", payload_size);
+				pr_debug("%s",string_buffer);
+				end = true;
 				break;
-				case 0x73:
-				sprintf(string_short_buffer, "Data src packet (%d B), ", payload_size);
-				strncat(string_buffer, string_short_buffer
-				, 255 - strlen(string_buffer) - 1);
-				
-				header_match = true;
+			case PKT_EVENTS_1B:
+			case PKT_EVENTS_2B:
+			case PKT_EVENTS_4B:
+			case PKT_EVENTS_8B:
+				pr_info_concat("Events packet (%d B), ", payload_size);
 				break;
-				case 0xFF:
-				pr_debug("Uninitialised!\n");
-				return -0xFF;
+			case PKT_DATA_SOURCE_1B:
+			case PKT_DATA_SOURCE_2B:
+			case PKT_DATA_SOURCE_4B:
+			case PKT_DATA_SOURCE_RES:
+				pr_info_concat("Data src packet (%d B), ", payload_size);
+				break;
+			case PKT_CONTEXT_EL1:
+			case PKT_CONTEXT_EL2:
+			case PKT_CONTEXT_RES0:
+			case PKT_CONTEXT_RES1:
+				pr_info_concat("Context packet (%d B), ", payload_size);
+				break;
+			case PKT_OP_TYPE_OTHER:
+			case PKT_OP_TYPE_LDST:
+			case PKT_OP_TYPE_BRANCH:
+			case PKT_OP_TYPE_RES0:
+				pr_info_concat("OP type packet (%d B), ", payload_size);
+				break;
+			case PKT_ADDR_SH_PC:
+			case PKT_ADDR_SH_B_TARGET:
+			case PKT_ADDR_SH_ACC_VA:
+			case PKT_ADDR_SH_ACC_PA:
+			case PKT_ADDR_SH_RES0:
+			case PKT_ADDR_SH_RES1:
+			case PKT_ADDR_SH_IMPL_DEF_0:
+			case PKT_ADDR_SH_IMPL_DEF_1:
+				pr_info_concat("Address packet (%d B), ", payload_size);
+				break;
+			case PKT_CNT_SH_TOT_LAT:
+			case PKT_CNT_SH_ISSUE_LAT:
+			case PKT_CNT_SH_XLAT:
+			case PKT_CNT_SH_RES0:
+			case PKT_CNT_SH_RES1:
+			case PKT_CNT_SH_RES2:
+			case PKT_CNT_SH_IMPL_DEF_0:
+			case PKT_CNT_SH_IMPL_DEF_1:
+				pr_info_concat("Counter packet (%d B), ", payload_size);
+				break;
+			case PKT_LONG_GENERIC_0:
+			case PKT_LONG_GENERIC_1:
+			case PKT_LONG_GENERIC_2:
+			case PKT_LONG_GENERIC_3:
+				extended_packets++;
+			break;
+			case PKT_UNINITIALISED:
+				pr_warn("Uninitialised!\n");
+				//TODO:  better return from else-where
+				return -((int)0xFF);
+				break;
 				default:
-				// Do nothing
-				break;
-
-			}
-			switch(header | 0x03){
-				case 0x67:
-				sprintf(string_short_buffer, "Context packet (%d B), ", payload_size);
-				strncat(string_buffer, string_short_buffer
-				, 255 - strlen(string_buffer) - 1);
-				
-				header_match = true;
-				break;
-				case 0x4B:
-				sprintf(string_short_buffer, "OP type packet (%d B), ", payload_size);
-				strncat(string_buffer, string_short_buffer
-				, 255 - strlen(string_buffer) - 1);
-				
-				header_match = true;
-				break;
-				
-				case 0xB3:
-				case 0xB7:
-				sprintf(string_short_buffer, "Address packet (%d B), ", payload_size);
-				strncat(string_buffer, string_short_buffer
-				, 255 - strlen(string_buffer) - 1);
-				
-				header_match = true;
-				break;
-				
-				case 0x9B:
-				case 0x9F:
-				sprintf(string_short_buffer, "Counter packet (%d B), ", payload_size);
-				strncat(string_buffer, string_short_buffer
-				, 255 - strlen(string_buffer) - 1);
-				
-				header_match = true;
-				break;
-				default:
-				// Do nothing
+				header_match = false;
 				break;
 			}
-			if(!header_match)
-				pr_debug("Unknown packet (%d B)(%x), ", payload_size,header);
+		if(!header_match){
+			pr_debug("Unknown packet (%d B)(%x)", payload_size,header);
+			return -((int)header);
 		}
 		// This counts all non-padding packets
 		if(header != 0x00){
@@ -486,6 +550,7 @@ static int spe_reader(void *data)
 			 * current thread's control.
 			*/
 			void *limit = READ_ONCE(cinfo->primary.limit);
+			//TODO: evaluate this barrier, maybe it can be removed
 			smp_rmb();
 			if (cinfo->primary.buf < limit && 
 				READ_ONCE(
