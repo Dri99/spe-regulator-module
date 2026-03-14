@@ -62,6 +62,12 @@ do {				\
 	var1 = var2;		\
 	var2 = temp;		\
 }while(0);
+#define READ_CNTCPT_EL0()						\
+({ 									\
+	u64 __reg; asm volatile("mrs %0, cntpct_el0" : "=r" (__reg));	\
+	__reg;								\
+})
+
 #if CONFIG_PERF_OPTIMISED > 0
 #define pr_info_concat(_str,...)				\
 ({do {} while(0);})
@@ -209,6 +215,14 @@ unsigned int spe_bw_management_called[NR_CPUS];
 static char string_buffer[STR_BUFFER_LEN];
 static char string_short_buffer[STR_BUFFER_LEN];
 #endif
+static u64 first_ts = 0,last_ts = 0;
+static unsigned long long timestamp_delta = 0, precess_record_time;
+static unsigned long long read_records;
+struct ts_stats{
+	unsigned int spe_reader_delay;
+	unsigned int reader_process_delay;
+};
+static struct ts_stats *ts_stats_arr;
 //struct kobj_attribute etx_attr = __ATTR(etx_value, 0660, sysfs_show, sysfs_store);
 /**************************************************************************
  * Local Function Prototypes
@@ -316,6 +330,15 @@ static void spe_bw_manage_buffer(void *info){
 	
 	reg = read_sysreg_s(SYS_PMBSR_EL1);
 	//TODO: Missing check for syndrome
+	if(reg & BIT(SYS_PMBSR_EL1_COLL_SHIFT)){
+		/*
+		 * TODO: For now we don't care, however, we can levarege this
+		 * instead of the PMC to consider increasing the profiling 
+		 * period.
+		*/
+	}
+	// Mask COLL as we already checked it
+	reg = reg & ~BIT(SYS_PMBSR_EL1_COLL_SHIFT);
 	if(reg != 0){
 		pr_warn("spe_bw_manage_buffer(): SYS_PMBSR_EL1: %llx",reg);
 	} 
@@ -393,7 +416,7 @@ static int process_record(void *base){
 				break;
 			case PKT_END:
 #if CONFIG_PERF_OPTIMISED == 0
-				PR_TRACE("%s",string_buffer);
+				pr_info("%s",string_buffer);
 #endif
 				pr_debug("End packet\n");
 				end = true;
@@ -406,6 +429,7 @@ static int process_record(void *base){
 #if CONFIG_PERF_OPTIMISED == 0
 				PR_TRACE("%s",string_buffer);
 #endif
+				last_ts = timestamp;
 				end = true;
 				break;
 			case PKT_EVENTS_1B:
@@ -573,6 +597,7 @@ static int spe_reader(void *data)
 	unsigned int cpu;
 	u64 ones_mask = ~0x0; // This should make an all ones mask
 	bool at_least_one_reading = true;
+	unsigned long long ts_before_process, ts_after_process;
 
 	pr_info("spe_reader(): Starting on CPU %d\n", smp_processor_id());
 
@@ -597,13 +622,37 @@ static int spe_reader(void *data)
 			{
 
 				pr_debug("SPE record at %llx\n",(u64) cinfo->primary.buf);
-
+#if CONFIG_PERF_OPTIMISED < 2
+				dsb(ish);
+				isb();
+				ts_before_process = READ_CNTCPT_EL0();
+				dsb(ish);
+				isb();
+#endif
 				ret = process_record(cinfo->primary.buf);
+				/*
+				* Can be removed because depending on last_ts, 
+				* that is modified as last step inside 
+				* process_record()
+				*/
+#if CONFIG_PERF_OPTIMISED < 2
+				dsb(ish);
+				isb();
+#endif
 				if(ret < 0){
-					pr_info("Unrecognised packet header: %x", (unsigned int)(-ret));
+					PR_DEBUG("Unrecognised packet header: %x", (unsigned int)(-ret));
 				} else {
 					cinfo->primary.buf += 64UL;
-
+#if CONFIG_PERF_OPTIMISED < 2
+					read_records++;
+					ts_after_process = READ_CNTCPT_EL0();
+					ts_stats_arr[read_records%NUM_STATS_RECORDS].reader_process_delay = 
+						ts_before_process - last_ts ;
+					ts_stats_arr[read_records%NUM_STATS_RECORDS].spe_reader_delay = 
+						ts_after_process - ts_before_process ;
+					timestamp_delta = timestamp_delta 
+								+ (ts_before_process - last_ts);
+#endif
 					//With the equal comparison, it will only trigger once
 					if (cinfo->primary.buf == cinfo->primary.watermark ){
 						pr_debug("spe_reader():watermark hit\n");
@@ -641,6 +690,32 @@ static int spe_reader(void *data)
 	return 0;
 }
 
+#if CONFIG_PERF_OPTIMISED < 2
+static void compute_stats(unsigned long *read_delay_avg,
+				unsigned long *read_delay_err,
+				unsigned long *proc_delay_avg,
+				unsigned long *proc_delay_err)
+{
+	unsigned int i;
+	unsigned long long effective_saved_stats = min(read_records,
+							NUM_STATS_RECORDS);
+	*read_delay_avg = *read_delay_err = *proc_delay_avg = *proc_delay_err = 0;
+	for(i=0; i<effective_saved_stats; i++){
+		*read_delay_avg += ts_stats_arr[i].spe_reader_delay;
+		*proc_delay_avg += ts_stats_arr[i].reader_process_delay;
+	}
+	*read_delay_avg = *read_delay_avg / effective_saved_stats;
+	*proc_delay_avg = *proc_delay_avg / effective_saved_stats;
+
+	for(i=0; i<effective_saved_stats; i++){
+		*read_delay_err += abs(*read_delay_avg - ts_stats_arr[i].spe_reader_delay);
+		*proc_delay_err += abs(*proc_delay_avg - ts_stats_arr[i].reader_process_delay);
+	}
+	*read_delay_err = *read_delay_err / effective_saved_stats;
+	*proc_delay_err = *proc_delay_err / effective_saved_stats;
+}
+#endif 
+
 static ssize_t sysfs_store_control(struct kobject *kobj,
 			     struct kobj_attribute *attr,
 			     const char *buf, size_t count)
@@ -652,6 +727,10 @@ static ssize_t sysfs_store_control(struct kobject *kobj,
 	if (sysfs_streq(buf, "start")) {
 		if (spe.running)
 			return count;
+		timestamp_delta = 0;
+		read_records = 0;
+		precess_record_time = 0;
+		first_ts = 0;
 		
 		spe.size = BUFFER_SIZE;
 		for_each_cpu(i, spe.target_cpu){
@@ -746,6 +825,23 @@ static ssize_t sysfs_store_control(struct kobject *kobj,
 
 		pr_info("sysfs_store_control: SPE stopped\n");
 		pr_debug("sysfs_store_control: Found %d extended packets\n",extended_packets);	
+		pr_debug("First TS seen: %lld, last TS seen: %lld\n", first_ts,last_ts);
+#if CONFIG_PERF_OPTIMISED
+		pr_info("Average timestamp drift: %lld\n", timestamp_delta/read_records);
+		pr_info("Total records analysed: %lld\n",read_records);
+		{
+			unsigned long read_delay_avg;
+			unsigned long read_delay_err;
+			unsigned long proc_delay_avg;
+			unsigned long proc_delay_err;
+			compute_stats( &read_delay_avg, &read_delay_err,
+					&proc_delay_avg, &proc_delay_err);
+			pr_info("Average delay in reception: %ld +- %ld\n", 
+				read_delay_avg, read_delay_err);
+			pr_info("Average delay in processing: %ld +- %ld\n", 
+				proc_delay_avg, proc_delay_err);
+		}
+#endif
 	}
 
 	return count;
@@ -1118,6 +1214,10 @@ static int __init spe_guard_init(void)
 
 	memset(global, 0, sizeof(struct spe_ctrl));
 	zalloc_cpumask_var(&global->target_cpu, GFP_NOWAIT);
+	ts_stats_arr = vmalloc(sizeof(struct ts_stats)*2*2^20);
+	if(!ts_stats_arr){
+		return -ENOMEM;
+	}
 		
 	global->filter_ld = true;
 	global->ts_enable = true;
