@@ -42,7 +42,6 @@
 //TODO: this should be a module parameter
 
 #define BUFFER_SIZE (1 << 21)
-#define NUM_STATS_RECORDS (2*2^20ULL)
 #define SPE_BW_PERIOD 256
 #define WATERMARK_NUM 1
 #define WATERMARK_DEN 2
@@ -200,6 +199,7 @@ enum spe_bw_buf_fault_action {
 	SPE_BW_BUF_FAULT_ACT_OK,
 };
 
+static const size_t NUM_STATS_RECORDS=1<<(2+20);
 /**************************************************************************
  * Global Variables
  **************************************************************************/
@@ -646,9 +646,9 @@ static int spe_reader(void *data)
 #if CONFIG_PERF_OPTIMISED < 2
 					read_records++;
 					ts_after_process = READ_CNTCPT_EL0();
-					ts_stats_arr[read_records%NUM_STATS_RECORDS].reader_process_delay = 
-						ts_before_process - last_ts ;
 					ts_stats_arr[read_records%NUM_STATS_RECORDS].spe_reader_delay = 
+						ts_before_process - last_ts ;
+					ts_stats_arr[read_records%NUM_STATS_RECORDS].reader_process_delay = 
 						ts_after_process - ts_before_process ;
 					timestamp_delta = timestamp_delta 
 								+ (ts_before_process - last_ts);
@@ -691,18 +691,20 @@ static int spe_reader(void *data)
 }
 
 #if CONFIG_PERF_OPTIMISED < 2
-static void compute_stats(unsigned long *read_delay_avg,
-				unsigned long *read_delay_err,
-				unsigned long *proc_delay_avg,
-				unsigned long *proc_delay_err)
+static void compute_stats(unsigned long long *read_delay_avg,
+				unsigned long long *read_delay_err,
+				unsigned long long *proc_delay_avg,
+				unsigned long long *proc_delay_err)
 {
 	unsigned int i;
 	unsigned long long effective_saved_stats = min(read_records,
-							NUM_STATS_RECORDS);
+							(unsigned long long)NUM_STATS_RECORDS);
+
 	*read_delay_avg = *read_delay_err = *proc_delay_avg = *proc_delay_err = 0;
 	for(i=0; i<effective_saved_stats; i++){
 		*read_delay_avg += ts_stats_arr[i].spe_reader_delay;
 		*proc_delay_avg += ts_stats_arr[i].reader_process_delay;
+		PR_DEBUG("%d\n",ts_stats_arr[i].spe_reader_delay);
 	}
 	*read_delay_avg = *read_delay_avg / effective_saved_stats;
 	*proc_delay_avg = *proc_delay_avg / effective_saved_stats;
@@ -826,19 +828,19 @@ static ssize_t sysfs_store_control(struct kobject *kobj,
 		pr_info("sysfs_store_control: SPE stopped\n");
 		pr_debug("sysfs_store_control: Found %d extended packets\n",extended_packets);	
 		pr_debug("First TS seen: %lld, last TS seen: %lld\n", first_ts,last_ts);
-#if CONFIG_PERF_OPTIMISED
+#if CONFIG_PERF_OPTIMISED < 2
 		pr_info("Average timestamp drift: %lld\n", timestamp_delta/read_records);
 		pr_info("Total records analysed: %lld\n",read_records);
 		{
-			unsigned long read_delay_avg;
-			unsigned long read_delay_err;
-			unsigned long proc_delay_avg;
-			unsigned long proc_delay_err;
+			unsigned long long read_delay_avg = 0;
+			unsigned long long read_delay_err = 0;
+			unsigned long long proc_delay_avg = 0;
+			unsigned long long proc_delay_err = 0;
 			compute_stats( &read_delay_avg, &read_delay_err,
 					&proc_delay_avg, &proc_delay_err);
-			pr_info("Average delay in reception: %ld +- %ld\n", 
+			pr_info("Average delay in reception: %lld +- %lld\n", 
 				read_delay_avg, read_delay_err);
-			pr_info("Average delay in processing: %ld +- %ld\n", 
+			pr_info("Average delay in processing: %lld +- %lld\n", 
 				proc_delay_avg, proc_delay_err);
 		}
 #endif
@@ -1214,7 +1216,7 @@ static int __init spe_guard_init(void)
 
 	memset(global, 0, sizeof(struct spe_ctrl));
 	zalloc_cpumask_var(&global->target_cpu, GFP_NOWAIT);
-	ts_stats_arr = vmalloc(sizeof(struct ts_stats)*2*2^20);
+	ts_stats_arr = vmalloc(sizeof(struct ts_stats)*NUM_STATS_RECORDS);
 	if(!ts_stats_arr){
 		return -ENOMEM;
 	}
