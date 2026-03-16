@@ -14,6 +14,7 @@
 #include <linux/bug.h>
 #include <linux/capability.h>
 #include <linux/cpuhotplug.h>
+#include <linux/cpu_pm.h>
 #include <linux/cpumask.h>
 #include <linux/delay.h>
 #include <linux/device.h>
@@ -1008,6 +1009,25 @@ static irqreturn_t spe_bw_irq_handler(int irq, void *dev)
 	return IRQ_HANDLED;
 }
 
+static int spe_pm_callback(struct notifier_block *nb,
+                           unsigned long action,
+                           void *data)
+{
+    switch (action) {
+
+    case CPU_PM_ENTER:
+        PR_DEBUG("CPU %d going sleep.\n", smp_processor_id());
+        break;
+
+    case CPU_PM_EXIT:
+        /* CPU resumed from low power state */
+        PR_DEBUG("CPU %d waking up.\n", smp_processor_id());
+        break;
+    }
+
+    return NOTIFY_OK;
+}
+
 static int spe_bw_device_probe(struct platform_device *pdev)
 {
 	int ret;
@@ -1084,6 +1104,10 @@ static struct platform_driver spe_bw_driver = {
 	.probe	= spe_bw_device_probe,
 	// No dynamic allocation to free
 	.remove	= spe_bw_device_remove, 
+};
+
+static struct notifier_block spe_pm_nb = {
+    .notifier_call = spe_pm_callback,
 };
 
 // Initialization function (called when the module is loaded)
@@ -1234,6 +1258,8 @@ static int __init spe_guard_init(void)
 
 	core_info = alloc_percpu(struct core_info);
 
+	cpu_pm_register_notifier(&spe_pm_nb);
+
 	spe_kobj = kobject_create_and_add("spe_regulator", kernel_kobj);
 	if (!spe_kobj){
 		ret = -ENOMEM;
@@ -1279,6 +1305,8 @@ static void __exit spe_guard_exit(void)
 	sysfs_remove_file(spe_kobj, &target_cpu_attr.attr);
 	sysfs_remove_file(spe_kobj, &reader_cpu_attr.attr);
 	kobject_put(spe_kobj);
+
+	cpu_pm_unregister_notifier(&spe_pm_nb);
 	printk(KERN_INFO "Goodbye, world!\n");
 }
 
