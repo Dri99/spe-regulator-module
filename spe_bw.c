@@ -203,7 +203,9 @@ enum spe_bw_buf_fault_action {
 	SPE_BW_BUF_FAULT_ACT_OK,
 };
 
+// This must be a power of 2
 static const size_t NUM_STATS_RECORDS=1<<(2+20);
+
 /**************************************************************************
  * Global Variables
  **************************************************************************/
@@ -319,7 +321,13 @@ static u64 spe_bw_get_record_timestamp(void *payload_addr){
 	return timestamp;
 }
 
-static void spe_bw_manage_buffer(void *info){
+/*
+ * Run in interrupt, stops SPE on a buffer, and restarts it on the secondary.
+ * It sets primary limit to the point where 
+ * When spe_reader  
+*/
+static void spe_bw_manage_buffer(void *info)
+{
 	unsigned int cpu = smp_processor_id();
 	struct spe_ctrl *spe_ctrl = (struct spe_ctrl*) info;
 	struct core_info *cinfo = this_cpu_ptr(core_info);
@@ -355,6 +363,11 @@ static void spe_bw_manage_buffer(void *info){
 	secondary_buf = cinfo->buffer_base
 			+ OTHER_BUFFER(cinfo->active_buffer) 
 			* spe_ctrl->size;
+	/*
+	 * TODO: This memset is potentially expensive, and should not be used in
+	 * irq context. I should have to either make it done by a DMA, or 
+	 * initialise a worker thread.
+	*/
 	memset(secondary_buf,0xff,spe_ctrl->size);
 	secondary_limit = secondary_buf + spe_ctrl->size;
 	// Ensure memset is completed
@@ -381,7 +394,8 @@ static void spe_bw_manage_buffer(void *info){
 	
 }
 
-static int process_record(void *base){
+static int process_record(void *base)
+{
 	bool end = false;
 	void *header_addr = base;
 	u8 header;
@@ -415,7 +429,7 @@ static int process_record(void *base){
 								header);
 		}
 
-				header_match = true;
+		header_match = true;
 		switch(header){
 			case PKT_PADDING:
 			//Do Nothing
@@ -572,8 +586,8 @@ static void spe_enable_cpu(void *info)
 	// Set other flags and start sampling
 	reg = spe_bw_fill_pmscr();
 	write_sysreg_s(reg, SYS_PMSCR_EL1);
-    	
-    	isb();
+
+	isb();
 	pr_debug("SPE engine started on CPU %d\n",smp_processor_id());
 }
 
