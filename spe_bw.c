@@ -612,6 +612,28 @@ static void spe_disable_cpu(void *info)
     PR_DEBUG("The IRQ had been called %d times", irq_called);
 }
 
+#if CONFIG_PERF_OPTIMISED < 2
+static void update_stats_arr(unsigned long long ts_before_process) 
+{
+	unsigned long long ts_after_process;
+	unsigned long long stats_arr_i;
+
+	read_records++;
+	ts_after_process = READ_CNTCPT_EL0();
+	stats_arr_i = read_records & (NUM_STATS_RECORDS-1);
+	ts_stats_arr[stats_arr_i].spe_reader_delay = 
+		ts_before_process - last_ts ;
+	ts_stats_arr[stats_arr_i].reader_process_delay = 
+		ts_after_process - ts_before_process ;
+	timestamp_delta = timestamp_delta 
+				+ (ts_before_process - last_ts);
+}
+#else
+static void update_stats_arr(unsigned long long ts_before_process)
+{
+	return;
+}
+#endif
 
 static int spe_reader(void *data)
 {
@@ -620,8 +642,7 @@ static int spe_reader(void *data)
 	unsigned int cpu;
 	u64 ones_mask = ~0x0; // This should make an all ones mask
 	bool at_least_one_reading = true;
-	unsigned long long ts_before_process, ts_after_process;
-	unsigned int stats_arr_i;
+	unsigned long long ts_before_process;
 
 	pr_info("spe_reader(): Starting on CPU %d\n", smp_processor_id());
 
@@ -668,17 +689,7 @@ static int spe_reader(void *data)
 					return false;
 				} else {
 					cinfo->primary.buf += 64UL;
-#if CONFIG_PERF_OPTIMISED < 2
-					read_records++;
-					ts_after_process = READ_CNTCPT_EL0();
-					stats_arr_i = read_records & (NUM_STATS_RECORDS-1);
-					ts_stats_arr[stats_arr_i].spe_reader_delay = 
-						ts_before_process - last_ts ;
-					ts_stats_arr[read_records%NUM_STATS_RECORDS].reader_process_delay = 
-						ts_after_process - ts_before_process ;
-					timestamp_delta = timestamp_delta 
-								+ (ts_before_process - last_ts);
-#endif
+					update_stats_arr(ts_before_process);
 					//With the equal comparison, it will only trigger once
 					if (cinfo->primary.buf == cinfo->primary.watermark ){
 						pr_debug("spe_reader():watermark hit\n");
