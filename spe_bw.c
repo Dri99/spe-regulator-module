@@ -1110,6 +1110,14 @@ static struct notifier_block spe_pm_nb = {
     .notifier_call = spe_pm_callback,
 };
 
+static void enable_el0_cntpct(void *data){
+	u64 reg = read_sysreg_s(SYS_CNTKCTL_EL1);
+	pr_debug("CPU %d:: SYS_CNTKCTL_EL1: %llx\n",smp_processor_id(), reg);
+	// Setting EL0PCTEN bit
+	reg |= BIT(0);
+	write_sysreg_s(reg, SYS_CNTKCTL_EL1); 
+}
+
 // Initialization function (called when the module is loaded)
 static int __init spe_guard_init(void)
 {
@@ -1237,6 +1245,12 @@ static int __init spe_guard_init(void)
 		counter_sz = 16;
 	}
 	pr_debug("Countsize is %d\n",counter_sz);
+
+	for_each_cpu(interval, cpu_possible_mask){
+		smp_call_function_single(interval,
+				enable_el0_cntpct,
+				NULL, 1);
+	}
 
 	memset(global, 0, sizeof(struct spe_ctrl));
 	zalloc_cpumask_var(&global->target_cpu, GFP_NOWAIT);
