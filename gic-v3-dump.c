@@ -137,9 +137,6 @@ void bsp_irq_dump(void)
 	pr_info("SYS_ICC_IGRPEN1_EL1: %08llx\n", read_sysreg_s(SYS_ICC_IGRPEN1_EL1));
 	pr_info("SYS_ICC_PMR_EL1: %08llx\n", read_sysreg_s(SYS_ICC_PMR_EL1));;
 	
-	
-	pr_info("GIC HPPIR: %08lx\n", icc_get_hppir());
-	
 	cpu_id = smp_processor_id();
 
 	pr_info("GICD_CTLR  = 0x%08x\n", readl(gicd + 0x0000));
