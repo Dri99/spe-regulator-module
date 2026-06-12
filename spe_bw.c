@@ -673,57 +673,65 @@ static inline void request_buffer_maintenance(struct spe_ctrl *s, int cpu)
 
 }
 
+static bool try_read_record(struct spe_ctrl *s,
+				unsigned int cpu)
+{
+	int ret = -1;
+	unsigned long long ts_before_process;
+	u64 ones_mask = ~0x0; // This should make an all ones mask
+	struct core_info * cinfo = per_cpu_ptr(core_info,cpu);
+	/*
+		* spe_buf::limit can change out of the control of
+		* current thread's control.
+	*/
+	void *limit = READ_ONCE(cinfo->primary.limit);
+	u64 next_to_read = READ_ONCE(*(u64 *)(cinfo->primary.buf + s->advance));
+	//TODO: evaluate this barrier, maybe it can be removed
+	smp_rmb();
+	if (cinfo->primary.buf < limit &&
+		next_to_read != ones_mask)
+	{
+		PR_DEBUG("SPE record at %llx\n",(u64) cinfo->primary.buf);
+
+		ts_before_process = get_exact_cntpct();
+
+		ret = process_record(cinfo->primary.buf);
+
+		if(ret < 0){
+			PR_DEBUG("Unrecognised packet header: %x", (unsigned int)(-ret));
+			return -1;
+		}
+		cinfo->primary.buf += 64UL;
+		update_stats_arr(ts_before_process);
+
+		//With the equal comparison, it will only trigger once
+		if (cinfo->primary.buf == cinfo->primary.watermark ) {
+			PR_DEBUG("spe_reader():watermark hit\n");
+			request_buffer_maintenance(s,cpu);
+		}
+	}
+
+	// Restore a waiting buffer, if the secondary is ready
+	if(cinfo->primary.buf == limit && READ_ONCE(cinfo->secondary.ready))
+		swap_spe_buffers(cinfo);
+	return (ret == 0);
+}
+
 static int spe_reader(void *data)
 {
 	struct spe_ctrl *s = data;
-	int ret;
 	unsigned int cpu;
-	u64 ones_mask = ~0x0; // This should make an all ones mask
 	bool at_least_one_reading = true;
-	unsigned long long ts_before_process;
 
 	pr_info("spe_reader(): Starting on CPU %d\n", smp_processor_id());
 
 
 	while (at_least_one_reading || !kthread_should_stop() ) {
 		at_least_one_reading = false;
-		
+
 		for_each_cpu(cpu, s->target_cpu){
-			struct core_info * cinfo = per_cpu_ptr(core_info,cpu);
-			/*
-			 * spe_buf::limit can change out of the control of
-			 * current thread's control.
-			*/
-			void *limit = READ_ONCE(cinfo->primary.limit);
-			u64 next_to_read = READ_ONCE(*(u64 *)(cinfo->primary.buf + s->advance));
-			//TODO: evaluate this barrier, maybe it can be removed
-			smp_rmb();
-			if (cinfo->primary.buf < limit &&
-				next_to_read != ones_mask)
-			{
-				pr_debug("SPE record at %llx\n",(u64) cinfo->primary.buf);
-
-				ts_before_process = get_exact_cntpct();
-
-				ret = process_record(cinfo->primary.buf);
-
-				if(ret < 0){
-					PR_DEBUG("Unrecognised packet header: %x", (unsigned int)(-ret));
-					return -1;
-				}
-				cinfo->primary.buf += 64UL;
-				update_stats_arr(ts_before_process);
-
-				//With the equal comparison, it will only trigger once
-				if (cinfo->primary.buf == cinfo->primary.watermark ) {
-					pr_debug("spe_reader():watermark hit\n");
-					request_buffer_maintenance(s,cpu);
-				}
-			}
-
-			// Restore a waiting buffer, if the secondary is ready
-			if(cinfo->primary.buf == limit && READ_ONCE(cinfo->secondary.ready))
-				swap_spe_buffers(cinfo);
+			if(try_read_record(s, cpu))
+				at_least_one_reading = true;
 		}
 		cpu_relax();
 	}
