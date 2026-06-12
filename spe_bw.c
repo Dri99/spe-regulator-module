@@ -1065,14 +1065,14 @@ static int spe_bw_device_probe(struct platform_device *pdev)
 
 	ret = spe_bw_irq_probe(spe_ctrl);
 	if (ret)
-		goto out_free_handle;
+		goto clean_exit;
 
 
 	/* Request our PPIs (note that the IRQ is still disabled) */
 	ret = request_percpu_irq(spe_ctrl->irq, spe_bw_irq_handler, "spe_bw",
 				 spe_ctrl);
 	if (ret)
-		return ret;
+		goto clean_exit;
 
 	// ret = arm_spe_pmu_dev_init(spe_pmu);
 	// if (ret)
@@ -1083,9 +1083,12 @@ static int spe_bw_device_probe(struct platform_device *pdev)
 //out_teardown_dev:
 	// Again, only when will allocate here 
 	//arm_spe_pmu_dev_teardown(spe_pmu);
-out_free_handle:
+//out_free_handle:
 	//Again, only when will allocate per cpu
 	//free_percpu(spe_ctrl->handle);
+	
+clean_exit:
+	PR_DEBUG("Something wrong in probe\n");
 	return ret;
 }
 
@@ -1267,7 +1270,9 @@ static int __init spe_guard_init(void)
 	zalloc_cpumask_var(&global->target_cpu, GFP_NOWAIT);
 	ts_stats_arr = vmalloc(sizeof(struct ts_stats)*NUM_STATS_RECORDS);
 	if(!ts_stats_arr){
-		return -ENOMEM;
+		// Nothing else was allocated/initialised
+		ret = -ENOMEM;
+		goto clean_exit;
 	}
 		
 	global->filter_ld = true;
@@ -1289,7 +1294,7 @@ static int __init spe_guard_init(void)
 	spe_kobj = kobject_create_and_add("spe_regulator", kernel_kobj);
 	if (!spe_kobj){
 		ret = -ENOMEM;
-		goto failed_kobj;
+		goto free_ts_stats;
 	}
 
 	if(sysfs_create_file(spe_kobj, &control_attr.attr)<0){
@@ -1308,24 +1313,33 @@ static int __init spe_guard_init(void)
 	spe_bw_init_debugfs();
 	
 	ret = platform_driver_register(&spe_bw_driver);
-	if(ret)
-		return ret;
+	if(ret){
+		ret = -ret;
+		goto failed_file_creation;
+	}
 	
 	return 0;  // Return 0 means success
 	//platform_driver_unregister(&spe_bw_driver);
-	failed_file_creation:
+
+failed_file_creation:
 	sysfs_remove_file(spe_kobj, &control_attr.attr);
 	sysfs_remove_file(spe_kobj, &target_cpu_attr.attr);
 	sysfs_remove_file(spe_kobj, &reader_cpu_attr.attr);
-	failed_kobj:
-
+	
 	kobject_put(spe_kobj);
+	
+free_ts_stats:
+	kvfree(ts_stats_arr);
+
+clean_exit:
+	PR_DEBUG("Something in init went wrong\n");
 	return ret;
 }
 
 // Exit function (called when the module is removed)
 static void __exit spe_guard_exit(void)
 {
+	free_cpumask_var(spe.target_cpu);
 	platform_driver_unregister(&spe_bw_driver);
 	sysfs_remove_file(spe_kobj, &control_attr.attr);
 	sysfs_remove_file(spe_kobj, &target_cpu_attr.attr);
@@ -1333,6 +1347,7 @@ static void __exit spe_guard_exit(void)
 	kobject_put(spe_kobj);
 
 	cpu_pm_unregister_notifier(&spe_pm_nb);
+	kvfree(ts_stats_arr);
 	printk(KERN_INFO "Goodbye, world!\n");
 }
 
