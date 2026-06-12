@@ -179,6 +179,7 @@ struct spe_ctrl {
 	int irq;
 
 	bool filter_ld;
+	bool filter_st;
 	bool ts_enable;
 	bool pa_enable;
 	bool pct_enable;
@@ -538,6 +539,9 @@ static void spe_enable_cpu(void *info)
 	// Enable Filter by type
 	if(s->filter_ld)
 		reg |= BIT(SYS_PMSFCR_EL1_LD_SHIFT);
+	if(s->filter_st)
+		reg |= BIT(SYS_PMSFCR_EL1_ST_SHIFT);
+	
 	// If at least one filter is active, activate them all
 	if (reg)
 		reg |= BIT(SYS_PMSFCR_EL1_FT_SHIFT);
@@ -1264,6 +1268,7 @@ static int __init spe_guard_init(void)
 	}
 		
 	global->filter_ld = true;
+	global->filter_st = false;
 	global->ts_enable = true;
 	global->pa_enable = true;
 	global->pct_enable = true;
