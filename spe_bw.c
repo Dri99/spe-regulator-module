@@ -607,6 +607,7 @@ static int spe_reader(void *data)
 	u64 ones_mask = ~0x0; // This should make an all ones mask
 	bool at_least_one_reading = true;
 	unsigned long long ts_before_process, ts_after_process;
+	unsigned int stats_arr_i;
 
 	pr_info("spe_reader(): Starting on CPU %d\n", smp_processor_id());
 
@@ -650,12 +651,14 @@ static int spe_reader(void *data)
 #endif
 				if(ret < 0){
 					PR_DEBUG("Unrecognised packet header: %x", (unsigned int)(-ret));
+					return false;
 				} else {
 					cinfo->primary.buf += 64UL;
 #if CONFIG_PERF_OPTIMISED < 2
 					read_records++;
 					ts_after_process = READ_CNTCPT_EL0();
-					ts_stats_arr[read_records%NUM_STATS_RECORDS].spe_reader_delay = 
+					stats_arr_i = read_records & (NUM_STATS_RECORDS-1);
+					ts_stats_arr[stats_arr_i].spe_reader_delay = 
 						ts_before_process - last_ts ;
 					ts_stats_arr[read_records%NUM_STATS_RECORDS].reader_process_delay = 
 						ts_after_process - ts_before_process ;
