@@ -31,22 +31,26 @@
 #include <linux/printk.h>
 #include <linux/slab.h>
 #include <linux/smp.h>
-#include <asm/unaligned.h>
+#include <linux/types.h>
 #include <linux/vmalloc.h>
+#include <asm/unaligned.h>
 
 #include <asm/barrier.h>
 #include <asm/cpufeature.h>
 #include <asm/mmu.h>
 #include <asm/sysreg.h>
 
+#include "spe_ring.h"
+#include "gic-v3-dump.h"
+
 #define STR_BUFFER_LEN 255
 //TODO: this should be a module parameter
 
 #define BUFFER_SIZE (1 << 21)
-#define SPE_BW_PERIOD 256
+#define SPE_BW_PERIOD 512
 #define WATERMARK_NUM 1
 #define WATERMARK_DEN 2
-#define CONFIG_PERF_OPTIMISED 1
+#define CONFIG_PERF_OPTIMISED 2
 #define PKT_PAYLOAD_SZ_MASK (0x3)
 #define PKT_PAYLOAD_SZ_SHIFT (4)
 
@@ -151,6 +155,7 @@ enum spe_header_type
 	PKT_UNINITIALISED =	0xFF,
 };
 
+// TODO: add spinlock to touch buffers
 struct spe_buffer {
 	void *buf;
 	void *limit;
@@ -177,6 +182,7 @@ struct spe_ctrl {
 	int irq;
 
 	bool filter_ld;
+	bool filter_st;
 	bool ts_enable;
 	bool pa_enable;
 	bool pct_enable;
@@ -191,6 +197,7 @@ struct spe_ctrl {
 
 	struct task_struct *reader_task;
 	struct platform_device *pdev;
+	struct spe_ring_dev *spe_ring;
 	bool running;
 };
 
@@ -200,7 +207,9 @@ enum spe_bw_buf_fault_action {
 	SPE_BW_BUF_FAULT_ACT_OK,
 };
 
+// This must be a power of 2
 static const size_t NUM_STATS_RECORDS=1<<(2+20);
+
 /**************************************************************************
  * Global Variables
  **************************************************************************/
@@ -224,6 +233,8 @@ struct ts_stats{
 	unsigned int reader_process_delay;
 };
 static struct ts_stats *ts_stats_arr;
+static unsigned int ring_entries = 65536;
+static unsigned long overflowed_samples;
 //struct kobj_attribute etx_attr = __ATTR(etx_value, 0660, sysfs_show, sysfs_store);
 /**************************************************************************
  * Local Function Prototypes
@@ -282,7 +293,7 @@ static int spe_bw_irq_probe(struct spe_ctrl *spe_ctrl)
 
 	return 0;
 }
-
+#define SYS_PMSCR_EL1_EE_SHIFT		8
 /* Convert between user ABI and register values */
 static u64 spe_bw_fill_pmscr(void)
 {
@@ -291,6 +302,8 @@ static u64 spe_bw_fill_pmscr(void)
 	reg |= spe.ts_enable << SYS_PMSCR_EL1_TS_SHIFT;
 	reg |= spe.pa_enable << SYS_PMSCR_EL1_PA_SHIFT;
 	reg |= spe.pct_enable << SYS_PMSCR_EL1_PCT_SHIFT;
+	// Useless until not running on a FEAT_SPE_EXC cpu
+	// reg |= 0x11 << SYS_PMSCR_EL1_EE_SHIFT;
 	
 	if (!spe.exclude_user)
 		reg |= BIT(SYS_PMSCR_EL1_E0SPE_SHIFT);
@@ -314,7 +327,34 @@ static u64 spe_bw_get_record_timestamp(void *payload_addr){
 	return timestamp;
 }
 
-static void spe_bw_manage_buffer(void *info){
+static u64 spe_bw_get_record_vaddr(void *payload_addr){
+	u64 vaddr;
+	if(likely(((u64)payload_addr & (0x7U)) == 0U)){
+		vaddr = *(u64 *)payload_addr;
+	}else{
+		vaddr = get_unaligned((u64 *)payload_addr);
+	}
+	return vaddr;
+}
+
+static u64 spe_bw_get_record_pc(void *payload_addr){
+	u64 pc;
+	if(likely(((u64)payload_addr & (0x7U)) == 0U)){
+		pc = *(u64 *)payload_addr;
+	}else{
+		pc = get_unaligned((u64 *)payload_addr);
+	}
+	pc &= ~(0xffUL << 56);
+	return pc;
+}
+
+/*
+ * Run in interrupt, stops SPE on a buffer, and restarts it on the secondary.
+ * It sets primary limit to the point where 
+ * When spe_reader  
+*/
+static void spe_bw_manage_buffer(void *info)
+{
 	unsigned int cpu = smp_processor_id();
 	struct spe_ctrl *spe_ctrl = (struct spe_ctrl*) info;
 	struct core_info *cinfo = this_cpu_ptr(core_info);
@@ -340,16 +380,18 @@ static void spe_bw_manage_buffer(void *info){
 	}
 	// Mask COLL as we already checked it
 	reg = reg & ~BIT(SYS_PMBSR_EL1_COLL_SHIFT);
-	if(reg != 0){
-		pr_warn("spe_bw_manage_buffer(): SYS_PMBSR_EL1: %llx",reg);
-	} 
-
 	write_sysreg_s(0, SYS_PMBSR_EL1);
 
 	//Allocate secondary_buffer
 	secondary_buf = cinfo->buffer_base
 			+ OTHER_BUFFER(cinfo->active_buffer) 
 			* spe_ctrl->size;
+	/*
+	 * TODO: This memset is potentially expensive, and should not be used in
+	 * irq context. I should have to either make it done by a DMA, or 
+	 * initialise a worker thread.
+	*/
+	// 
 	memset(secondary_buf,0xff,spe_ctrl->size);
 	secondary_limit = secondary_buf + spe_ctrl->size;
 	// Ensure memset is completed
@@ -376,7 +418,9 @@ static void spe_bw_manage_buffer(void *info){
 	
 }
 
-static int process_record(void *base){
+#define CONFIG_SAMPLE_TS_VADDR
+static int process_record(void *base, struct sample *s)
+{
 	bool end = false;
 	void *header_addr = base;
 	u8 header;
@@ -389,7 +433,10 @@ static int process_record(void *base){
 	unsigned int packets_found = 0;
 	string_buffer[0] = '\0';
 #endif
-	while(header_addr < (base + 64UL) && !end){
+#ifdef CONFIG_SAMPLE_TS_VADDR
+	s->timestamp_module = READ_CNTCPT_EL0();
+#endif
+	while (header_addr < (base + 64UL) && !end) {
 		header = READ_ONCE(*(u8 *)header_addr);
 		header_size = 1;
 		payload_size = 0;
@@ -410,88 +457,102 @@ static int process_record(void *base){
 								header);
 		}
 
-				header_match = true;
-		switch(header){
-			case PKT_PADDING:
-			//Do Nothing
-				break;
-			case PKT_END:
-#if CONFIG_PERF_OPTIMISED == 0
-				pr_info("%s",string_buffer);
-#endif
-				pr_debug("End packet\n");
-				end = true;
-				break;
-			case PKT_TIMESTAMP:
-				timestamp = spe_bw_get_record_timestamp(header_addr+1);
-				pr_debug("Timestamp addr:%llx",(u64)(header_addr+1));
-				pr_debug("TImestamp:%lld", timestamp);
-				pr_info_concat("Timestamp packet(%d B), end\n", payload_size);
-#if CONFIG_PERF_OPTIMISED == 0
-				PR_TRACE("%s",string_buffer);
-#endif
-				last_ts = timestamp;
-				end = true;
-				break;
-			case PKT_EVENTS_1B:
-			case PKT_EVENTS_2B:
-			case PKT_EVENTS_4B:
-			case PKT_EVENTS_8B:
-				pr_info_concat("Events packet (%d B), ", payload_size);
-				break;
-			case PKT_DATA_SOURCE_1B:
-			case PKT_DATA_SOURCE_2B:
-			case PKT_DATA_SOURCE_4B:
-			case PKT_DATA_SOURCE_RES:
-				pr_info_concat("Data src packet (%d B), ", payload_size);
-				break;
-			case PKT_CONTEXT_EL1:
-			case PKT_CONTEXT_EL2:
-			case PKT_CONTEXT_RES0:
-			case PKT_CONTEXT_RES1:
-				pr_info_concat("Context packet (%d B), ", payload_size);
-				break;
-			case PKT_OP_TYPE_OTHER:
-			case PKT_OP_TYPE_LDST:
-			case PKT_OP_TYPE_BRANCH:
-			case PKT_OP_TYPE_RES0:
-				pr_info_concat("OP type packet (%d B), ", payload_size);
-				break;
-			case PKT_ADDR_SH_PC:
-			case PKT_ADDR_SH_B_TARGET:
-			case PKT_ADDR_SH_ACC_VA:
-			case PKT_ADDR_SH_ACC_PA:
-			case PKT_ADDR_SH_RES0:
-			case PKT_ADDR_SH_RES1:
-			case PKT_ADDR_SH_IMPL_DEF_0:
-			case PKT_ADDR_SH_IMPL_DEF_1:
-				pr_info_concat("Address packet (%d B), ", payload_size);
-				break;
-			case PKT_CNT_SH_TOT_LAT:
-			case PKT_CNT_SH_ISSUE_LAT:
-			case PKT_CNT_SH_XLAT:
-			case PKT_CNT_SH_RES0:
-			case PKT_CNT_SH_RES1:
-			case PKT_CNT_SH_RES2:
-			case PKT_CNT_SH_IMPL_DEF_0:
-			case PKT_CNT_SH_IMPL_DEF_1:
-				pr_info_concat("Counter packet (%d B), ", payload_size);
-				break;
-			case PKT_LONG_GENERIC_0:
-			case PKT_LONG_GENERIC_1:
-			case PKT_LONG_GENERIC_2:
-			case PKT_LONG_GENERIC_3:
-				extended_packets++;
+		header_match = true;
+		switch (header) {
+		case PKT_PADDING:
+		//Do Nothing
 			break;
-			case PKT_UNINITIALISED:
-				pr_warn("Uninitialised!\n");
-				//TODO:  better return from else-where
-				return -((int)0xFF);
-				break;
-				default:
-				header_match = false;
-				break;
-			}
+		case PKT_END:
+#if CONFIG_PERF_OPTIMISED == 0
+			pr_info("%s",string_buffer);
+#endif
+			pr_debug("End packet\n");
+			end = true;
+			break;
+		case PKT_TIMESTAMP:
+			timestamp = spe_bw_get_record_timestamp(header_addr+1);
+			pr_debug("Timestamp addr:%llx",(u64)(header_addr+1));
+			pr_debug("TImestamp:%lld", timestamp);
+			pr_info_concat("Timestamp packet(%d B), end\n", payload_size);
+#if CONFIG_PERF_OPTIMISED == 0
+			PR_TRACE("%s",string_buffer);
+#endif
+#ifdef CONFIG_SAMPLE_TS_VADDR
+			s->timestamp_spe = timestamp;
+#endif
+			last_ts = timestamp;
+			end = true;
+			break;
+		case PKT_EVENTS_1B:
+		case PKT_EVENTS_2B:
+		case PKT_EVENTS_4B:
+		case PKT_EVENTS_8B:
+			pr_info_concat("Events packet (%d B), ", payload_size);
+			break;
+		case PKT_DATA_SOURCE_1B:
+		case PKT_DATA_SOURCE_2B:
+		case PKT_DATA_SOURCE_4B:
+		case PKT_DATA_SOURCE_RES:
+			pr_info_concat("Data src packet (%d B), ", payload_size);
+			break;
+		case PKT_CONTEXT_EL1:
+		case PKT_CONTEXT_EL2:
+		case PKT_CONTEXT_RES0:
+		case PKT_CONTEXT_RES1:
+			pr_info_concat("Context packet (%d B), ", payload_size);
+			break;
+		case PKT_OP_TYPE_OTHER:
+		case PKT_OP_TYPE_LDST:
+		case PKT_OP_TYPE_BRANCH:
+		case PKT_OP_TYPE_RES0:
+			pr_info_concat("OP type packet (%d B), ", payload_size);
+			break;
+		case PKT_ADDR_SH_PC:
+#ifdef CONFIG_SAMPLE_TS_VADDR
+			s->pc = spe_bw_get_record_pc(header_addr+1);
+			pr_info_concat("Address packet (%d B), ", payload_size);
+			break;
+#endif
+		
+		case PKT_ADDR_SH_ACC_VA:
+#ifdef CONFIG_SAMPLE_TS_VADDR
+			s->vaddr = spe_bw_get_record_vaddr(header_addr+1);
+			pr_info_concat("Address packet (%d B), ", payload_size);
+			break;
+#endif
+		case PKT_ADDR_SH_B_TARGET:
+		case PKT_ADDR_SH_ACC_PA:
+		case PKT_ADDR_SH_RES0:
+		case PKT_ADDR_SH_RES1:
+		case PKT_ADDR_SH_IMPL_DEF_0:
+		case PKT_ADDR_SH_IMPL_DEF_1:
+			pr_info_concat("Address packet (%d B), ", payload_size);
+			break;
+		case PKT_CNT_SH_TOT_LAT:
+		case PKT_CNT_SH_ISSUE_LAT:
+		case PKT_CNT_SH_XLAT:
+		case PKT_CNT_SH_RES0:
+		case PKT_CNT_SH_RES1:
+		case PKT_CNT_SH_RES2:
+		case PKT_CNT_SH_IMPL_DEF_0:
+		case PKT_CNT_SH_IMPL_DEF_1:
+			pr_info_concat("Counter packet (%d B), ", payload_size);
+			break;
+		case PKT_LONG_GENERIC_0:
+		case PKT_LONG_GENERIC_1:
+		case PKT_LONG_GENERIC_2:
+		case PKT_LONG_GENERIC_3:
+			extended_packets++;
+		break;
+		case PKT_UNINITIALISED:
+			pr_warn("Uninitialised!\n");
+			//TODO:  better return from else-where
+			return -((int)0xFF);
+			break;
+			default:
+			header_match = false;
+			break;
+		}
 		if(!header_match){
 #if CONFIG_PERF_OPTIMISED == 0
 			PR_TRACE("%s",string_buffer);
@@ -524,6 +585,7 @@ static void spe_enable_cpu(void *info)
 	struct spe_ctrl *s = info;
 	u64 reg = 0;
 	struct core_info *cinfo = this_cpu_ptr(core_info);
+	struct irq_data* s_irq_data;
 	smp_rmb();
 	pr_info("cpu %d : spe_enable",smp_processor_id());
 	pr_debug("core_info address %llx",(u64)core_info);
@@ -534,6 +596,9 @@ static void spe_enable_cpu(void *info)
 	// Enable Filter by type
 	if(s->filter_ld)
 		reg |= BIT(SYS_PMSFCR_EL1_LD_SHIFT);
+	if(s->filter_st)
+		reg |= BIT(SYS_PMSFCR_EL1_ST_SHIFT);
+	
 	// If at least one filter is active, activate them all
 	if (reg)
 		reg |= BIT(SYS_PMSFCR_EL1_FT_SHIFT);
@@ -564,8 +629,8 @@ static void spe_enable_cpu(void *info)
 	// Set other flags and start sampling
 	reg = spe_bw_fill_pmscr();
 	write_sysreg_s(reg, SYS_PMSCR_EL1);
-    	
-    	isb();
+
+	isb();
 	pr_debug("SPE engine started on CPU %d\n",smp_processor_id());
 }
 
@@ -590,15 +655,134 @@ static void spe_disable_cpu(void *info)
     PR_DEBUG("The IRQ had been called %d times", irq_called);
 }
 
+#if CONFIG_PERF_OPTIMISED < 2
+static void update_stats_arr(unsigned long long ts_before_process) 
+{
+	unsigned long long ts_after_process;
+	unsigned long long stats_arr_i;
+
+	read_records++;
+	ts_after_process = READ_CNTCPT_EL0();
+	stats_arr_i = read_records & (NUM_STATS_RECORDS-1);
+	ts_stats_arr[stats_arr_i].spe_reader_delay = 
+		ts_before_process - last_ts ;
+	ts_stats_arr[stats_arr_i].reader_process_delay = 
+		ts_after_process - ts_before_process ;
+	timestamp_delta = timestamp_delta 
+				+ (ts_before_process - last_ts);
+}
+#else
+static void update_stats_arr(unsigned long long ts_before_process)
+{
+	return;
+}
+#endif
+
+//static bool end_of_buffer() 
+
+static bool try_read_record(struct spe_ctrl *s, 
+				unsigned int cpu, 
+				struct core_info *cinfo)
+{
+	int ret = -1;
+	unsigned long long ts_before_process;
+	u64 ones_mask = ~0x0; // This should make an all ones mask
+	/*
+	* spe_buf::limit can change out of the control of 
+	* current thread's control.
+	*/
+	void *limit = READ_ONCE(cinfo->primary.limit);
+	//TODO: evaluate this barrier, maybe it can be removed
+	smp_rmb();
+	if (cinfo->primary.buf < limit && 
+		READ_ONCE(
+			*(u64 *)(cinfo->primary.buf + s->advance)
+		) 
+		!= ones_mask) 
+	{
+		struct sample sample = {0};
+		pr_debug("SPE record at %llx\n",(u64) cinfo->primary.buf);
+#if CONFIG_PERF_OPTIMISED < 2
+		dsb(ish);
+		isb();
+		ts_before_process = READ_CNTCPT_EL0();
+		dsb(ish);
+		isb();
+#endif
+
+		ret = process_record(cinfo->primary.buf, &sample);
+		/*
+		* Can be removed because depending on last_ts, 
+		* that is modified as last step inside 
+		* process_record()
+		*/
+#if CONFIG_PERF_OPTIMISED < 2
+		dsb(ish);
+		isb();
+#endif
+		if(ret < 0){
+			PR_DEBUG("Unrecognised packet header: %x", (unsigned int)(-ret));
+			return false;
+		} else {
+			cinfo->primary.buf += 64UL;
+#if CONFIG_PERF_OPTIMISED < 2
+			// read_records++;
+			// ts_after_process = READ_CNTCPT_EL0();
+			// stats_arr_i = read_records & (NUM_STATS_RECORDS-1);
+			// ts_stats_arr[stats_arr_i].spe_reader_delay = 
+			// 	ts_before_process - last_ts ;
+			// ts_stats_arr[stats_arr_i].reader_process_delay = 
+			// 	ts_after_process - ts_before_process ;
+			// timestamp_delta = timestamp_delta 
+			// 			+ (ts_before_process - last_ts);
+#endif
+			update_stats_arr(ts_before_process);
+			if (s->spe_ring == NULL) {
+				pr_err("spe_ring NULL!!\n");
+			}
+			if (s->spe_ring[cpu].shared != NULL &&
+				spe_ring_push_sample_try(&(s->spe_ring[cpu]), sample) != 0) 
+			{
+				overflowed_samples++;
+			}
+			//With the equal comparison, it will only trigger once
+			if (cinfo->primary.buf == cinfo->primary.watermark ){
+				pr_debug("spe_reader():watermark hit\n");
+				if(0 != smp_call_function_single(cpu,
+					spe_bw_manage_buffer,
+					s, 0))
+				{				
+					pr_warn("error in calling " 
+						"spe_bw_manage_buffer");
+				}	
+				
+			}
+		}
+	}
+
+	// Restore a waiting buffer, if the secondary is ready
+	if(cinfo->primary.buf == limit && 
+		READ_ONCE(cinfo->secondary.ready))
+	{
+		cinfo->active_buffer = OTHER_BUFFER(cinfo->active_buffer);
+		SWAP(cinfo->primary.buf,cinfo->secondary.buf);
+		SWAP(cinfo->primary.limit,cinfo->secondary.limit);
+		SWAP(cinfo->primary.watermark,cinfo->secondary.watermark);
+		smp_wmb();
+		cinfo->secondary.ready = 0;
+		// cinfo->primary
+		// s->buf = s->secondary_buf;
+		// s->limit = s->secondary_limit;
+		// s->water_mark = s->secondary_watermark;
+	}
+	return (ret == 0);
+}
 
 static int spe_reader(void *data)
 {
 	struct spe_ctrl *s = data;
-	int ret;
 	unsigned int cpu;
-	u64 ones_mask = ~0x0; // This should make an all ones mask
 	bool at_least_one_reading = true;
-	unsigned long long ts_before_process, ts_after_process;
 
 	pr_info("spe_reader(): Starting on CPU %d\n", smp_processor_id());
 
@@ -606,84 +790,11 @@ static int spe_reader(void *data)
 	while (at_least_one_reading || !kthread_should_stop() ) {
 		at_least_one_reading = false;
 		
-		for_each_cpu(cpu, s->target_cpu){
+		for_each_cpu(cpu, s->target_cpu) {
 			struct core_info * cinfo = per_cpu_ptr(core_info,cpu);
-			/*
-			 * spe_buf::limit can change out of the control of 
-			 * current thread's control.
-			*/
-			void *limit = READ_ONCE(cinfo->primary.limit);
-			//TODO: evaluate this barrier, maybe it can be removed
-			smp_rmb();
-			if (cinfo->primary.buf < limit && 
-				READ_ONCE(
-					*(u64 *)(cinfo->primary.buf + s->advance)
-				) 
-				!= ones_mask) 
-			{
-
-				pr_debug("SPE record at %llx\n",(u64) cinfo->primary.buf);
-#if CONFIG_PERF_OPTIMISED < 2
-				dsb(ish);
-				isb();
-				ts_before_process = READ_CNTCPT_EL0();
-				dsb(ish);
-				isb();
-#endif
-				ret = process_record(cinfo->primary.buf);
-				/*
-				* Can be removed because depending on last_ts, 
-				* that is modified as last step inside 
-				* process_record()
-				*/
-#if CONFIG_PERF_OPTIMISED < 2
-				dsb(ish);
-				isb();
-#endif
-				if(ret < 0){
-					PR_DEBUG("Unrecognised packet header: %x", (unsigned int)(-ret));
-				} else {
-					cinfo->primary.buf += 64UL;
-#if CONFIG_PERF_OPTIMISED < 2
-					read_records++;
-					ts_after_process = READ_CNTCPT_EL0();
-					ts_stats_arr[read_records%NUM_STATS_RECORDS].spe_reader_delay = 
-						ts_before_process - last_ts ;
-					ts_stats_arr[read_records%NUM_STATS_RECORDS].reader_process_delay = 
-						ts_after_process - ts_before_process ;
-					timestamp_delta = timestamp_delta 
-								+ (ts_before_process - last_ts);
-#endif
-					//With the equal comparison, it will only trigger once
-					if (cinfo->primary.buf == cinfo->primary.watermark ){
-						pr_debug("spe_reader():watermark hit\n");
-						if(0 != smp_call_function_single(cpu,
-							spe_bw_manage_buffer,
-							s, 0))
-						{				
-							pr_warn("error in calling " 
-								"spe_bw_manage_buffer");
-						}	
-						
-					}
-				}
-			}
-		
-			// Restore a waiting buffer, if the secondary is ready
-			if(cinfo->primary.buf == limit && 
-				READ_ONCE(cinfo->secondary.ready))
-			{
-				cinfo->active_buffer = OTHER_BUFFER(cinfo->active_buffer);
-				SWAP(cinfo->primary.buf,cinfo->secondary.buf);
-				SWAP(cinfo->primary.limit,cinfo->secondary.limit);
-				SWAP(cinfo->primary.watermark,cinfo->secondary.watermark);
-				smp_wmb();
-				cinfo->secondary.ready = 0;
-				// cinfo->primary
-				// s->buf = s->secondary_buf;
-				// s->limit = s->secondary_limit;
-				// s->water_mark = s->secondary_watermark;
-			}
+			
+			if(try_read_record(s, cpu, cinfo))
+				at_least_one_reading = true;
 		}
 		cpu_relax();
 	}
@@ -734,6 +845,9 @@ static ssize_t sysfs_store_control(struct kobject *kobj,
 		read_records = 0;
 		precess_record_time = 0;
 		first_ts = 0;
+#ifdef CONFIG_SAMPLE_TS_VADDR
+		overflowed_samples = 0;
+#endif
 		
 		spe.size = BUFFER_SIZE;
 		for_each_cpu(i, spe.target_cpu){
@@ -844,6 +958,9 @@ static ssize_t sysfs_store_control(struct kobject *kobj,
 			pr_info("Average delay in processing: %lld +- %lld\n", 
 				proc_delay_avg, proc_delay_err);
 		}
+#endif
+#ifdef CONFIG_SAMPLE_TS_VADDR
+		pr_info("Total number of overflowed samples:%ld\n",overflowed_samples);
 #endif
 	}
 
@@ -967,10 +1084,10 @@ static irqreturn_t spe_bw_irq_handler(int irq, void *dev)
 	struct core_info *cinfo = this_cpu_ptr(core_info);
 	
 	enum spe_bw_buf_fault_action act;
+	pr_info("Irq called!!!\n");
 	if (!cinfo->buffer_base)
 		return IRQ_NONE;
 	
-	pr_info("Irq called\n");
 	act = spe_bw_buf_fault_act_get(cinfo);
 	if (act == SPE_BW_BUF_FAULT_ACT_SPURIOUS)
 		return IRQ_NONE;
@@ -1010,19 +1127,19 @@ static irqreturn_t spe_bw_irq_handler(int irq, void *dev)
 }
 
 static int spe_pm_callback(struct notifier_block *nb,
-                           unsigned long action,
-                           void *data)
+			   unsigned long action,
+			   void *data)
 {
     switch (action) {
 
     case CPU_PM_ENTER:
-        PR_DEBUG("CPU %d going sleep.\n", smp_processor_id());
-        break;
+	PR_DEBUG("CPU %d going sleep.\n", smp_processor_id());
+	break;
 
     case CPU_PM_EXIT:
-        /* CPU resumed from low power state */
-        PR_DEBUG("CPU %d waking up.\n", smp_processor_id());
-        break;
+	/* CPU resumed from low power state */
+	PR_DEBUG("CPU %d waking up.\n", smp_processor_id());
+	break;
     }
 
     return NOTIFY_OK;
@@ -1054,27 +1171,41 @@ static int spe_bw_device_probe(struct platform_device *pdev)
 
 	ret = spe_bw_irq_probe(spe_ctrl);
 	if (ret)
-		goto out_free_handle;
+		goto clean_exit;
 
 
 	/* Request our PPIs (note that the IRQ is still disabled) */
 	ret = request_percpu_irq(spe_ctrl->irq, spe_bw_irq_handler, "spe_bw",
 				 spe_ctrl);
 	if (ret)
-		return ret;
+		goto clean_exit;
 
 	// ret = arm_spe_pmu_dev_init(spe_pmu);
 	// if (ret)
 	// 	goto out_free_handle;
+	ret = spe_ring_dev_register(&spe_ctrl->spe_ring, ring_entries);
+	if (ret) {
+		goto free_irq;
+	}
+
+	dev_info(&pdev->dev,
+		"ring capacity=%u\n",
+		ring_entries);
 
 	return 0;
-
-//out_teardown_dev:
+	
+	free_irq:
+	free_percpu_irq(spe_ctrl->irq, spe_ctrl);
+	
+	//out_teardown_dev:
 	// Again, only when will allocate here 
 	//arm_spe_pmu_dev_teardown(spe_pmu);
-out_free_handle:
+	//out_free_handle:
 	//Again, only when will allocate per cpu
 	//free_percpu(spe_ctrl->handle);
+	
+	clean_exit:
+	PR_DEBUG("Something wrong in probe\n");
 	return ret;
 }
 
@@ -1086,6 +1217,7 @@ static int spe_bw_device_remove(struct platform_device *pdev)
 	//arm_spe_pmu_dev_teardown(spe_ctrl);
 	free_percpu_irq(spe_ctrl->irq, spe_ctrl);
 	//free_percpu(spe_ctrl->handle);
+	spe_ring_dev_deregister(spe_ctrl->spe_ring);
 	return 0;
 }
 
@@ -1109,6 +1241,14 @@ static struct platform_driver spe_bw_driver = {
 static struct notifier_block spe_pm_nb = {
     .notifier_call = spe_pm_callback,
 };
+
+static void enable_el0_cntpct(void *data){
+	u64 reg = read_sysreg_s(SYS_CNTKCTL_EL1);
+	pr_debug("CPU %d:: SYS_CNTKCTL_EL1: %llx\n",smp_processor_id(), reg);
+	// Setting EL0PCTEN bit
+	reg |= BIT(0);
+	write_sysreg_s(reg, SYS_CNTKCTL_EL1); 
+}
 
 // Initialization function (called when the module is loaded)
 static int __init spe_guard_init(void)
@@ -1134,7 +1274,7 @@ static int __init spe_guard_init(void)
 
 	reg = read_sysreg_s(SYS_CNTFRQ_EL0);
 	pr_debug("CNTFRQ_EL0=%llu/n",reg);
-
+	pr_info("ID_AA64DFR2_EL1=0x%llx",read_sysreg_s(sys_reg(3, 0, 0, 5, 2)));
 	pr_debug("Sleeping 100ms...");
 	//reg = read_sysreg_s(cntpct_el0);
 	asm volatile("mrs %0, cntpct_el0" : "=r" (reg));
@@ -1238,19 +1378,30 @@ static int __init spe_guard_init(void)
 	}
 	pr_debug("Countsize is %d\n",counter_sz);
 
+	reg = read_sysreg_s(SYS_CNTKCTL_EL1);
+	pr_info("SYS_CNTKCTL_EL1: %llx\n",reg);
+	for_each_cpu(interval, cpu_possible_mask){
+		smp_call_function_single(interval,
+				enable_el0_cntpct,
+				NULL, 1);
+	}
+
 	memset(global, 0, sizeof(struct spe_ctrl));
 	zalloc_cpumask_var(&global->target_cpu, GFP_NOWAIT);
 	ts_stats_arr = vmalloc(sizeof(struct ts_stats)*NUM_STATS_RECORDS);
 	if(!ts_stats_arr){
-		return -ENOMEM;
+		// Nothing else was allocated/initialised
+		ret = -ENOMEM;
+		goto clean_exit;
 	}
 		
-	global->filter_ld = true;
+	global->filter_ld = false;
+	global->filter_st = false;
 	global->ts_enable = true;
 	global->pa_enable = true;
 	global->pct_enable = true;
 	global->exclude_user = false;
-	global->exclude_kernel = false;
+	global->exclude_kernel = true;
 	global->cx_enable = true;
 	
 	global->period = SPE_BW_PERIOD;
@@ -1263,7 +1414,7 @@ static int __init spe_guard_init(void)
 	spe_kobj = kobject_create_and_add("spe_regulator", kernel_kobj);
 	if (!spe_kobj){
 		ret = -ENOMEM;
-		goto failed_kobj;
+		goto free_ts_stats;
 	}
 
 	if(sysfs_create_file(spe_kobj, &control_attr.attr)<0){
@@ -1282,24 +1433,33 @@ static int __init spe_guard_init(void)
 	spe_bw_init_debugfs();
 	
 	ret = platform_driver_register(&spe_bw_driver);
-	if(ret)
-		return ret;
+	if(ret){
+		ret = -ret;
+		goto failed_file_creation;
+	}
 	
 	return 0;  // Return 0 means success
 	//platform_driver_unregister(&spe_bw_driver);
+
 	failed_file_creation:
 	sysfs_remove_file(spe_kobj, &control_attr.attr);
 	sysfs_remove_file(spe_kobj, &target_cpu_attr.attr);
 	sysfs_remove_file(spe_kobj, &reader_cpu_attr.attr);
-	failed_kobj:
-
+	
 	kobject_put(spe_kobj);
+	
+	free_ts_stats:
+	kvfree(ts_stats_arr);
+
+	clean_exit:
+	PR_DEBUG("Something in init went wrong\n");
 	return ret;
 }
 
 // Exit function (called when the module is removed)
 static void __exit spe_guard_exit(void)
 {
+	free_cpumask_var(spe.target_cpu);
 	platform_driver_unregister(&spe_bw_driver);
 	sysfs_remove_file(spe_kobj, &control_attr.attr);
 	sysfs_remove_file(spe_kobj, &target_cpu_attr.attr);
@@ -1307,12 +1467,17 @@ static void __exit spe_guard_exit(void)
 	kobject_put(spe_kobj);
 
 	cpu_pm_unregister_notifier(&spe_pm_nb);
+	kvfree(ts_stats_arr);
 	printk(KERN_INFO "Goodbye, world!\n");
 }
 
 // Register the functions
 module_init(spe_guard_init);
 module_exit(spe_guard_exit);
+
+module_param(ring_entries, uint, 0444);
+MODULE_PARM_DESC(ring_entries,
+		 "Number of entries in ring buffer");
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("SPE based Memeguard Implementation");
