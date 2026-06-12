@@ -49,6 +49,8 @@
 #define CONFIG_PERF_OPTIMISED 1
 #define PKT_PAYLOAD_SZ_MASK (0x3)
 #define PKT_PAYLOAD_SZ_SHIFT (4)
+#define SYS_PMSCR_EL1_EE_SHIFT	8
+#define ID_AA64DFR2_EL1		sys_reg(3, 0, 0, 5, 2)
 
 #define BIT_GET(_fld, _reg) (_reg & BIT(_fld ## _SHIFT))
 #define BIT_SET(_fld) (_reg & BIT(_fld ## _SHIFT))
@@ -291,6 +293,8 @@ static u64 spe_bw_fill_pmscr(void)
 	reg |= spe.ts_enable << SYS_PMSCR_EL1_TS_SHIFT;
 	reg |= spe.pa_enable << SYS_PMSCR_EL1_PA_SHIFT;
 	reg |= spe.pct_enable << SYS_PMSCR_EL1_PCT_SHIFT;
+	// Useless until not running on a FEAT_SPE_EXC cpu
+	reg |= 0x11 << SYS_PMSCR_EL1_EE_SHIFT;
 	
 	if (!spe.exclude_user)
 		reg |= BIT(SYS_PMSCR_EL1_E0SPE_SHIFT);
@@ -1142,7 +1146,7 @@ static int __init spe_guard_init(void)
 
 	reg = read_sysreg_s(SYS_CNTFRQ_EL0);
 	pr_debug("CNTFRQ_EL0=%llu/n",reg);
-
+	pr_debug("ID_AA64DFR2_EL1=0x%llx",read_sysreg_s(ID_AA64DFR2_EL1));
 	pr_debug("Sleeping 100ms...");
 	//reg = read_sysreg_s(cntpct_el0);
 	asm volatile("mrs %0, cntpct_el0" : "=r" (reg));
