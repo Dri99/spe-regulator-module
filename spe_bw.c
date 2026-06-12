@@ -394,7 +394,7 @@ static void spe_bw_manage_buffer(void *info)
 	
 }
 
-static int process_record(void *base)
+static inline int process_record(void *base)
 {
 	bool end = false;
 	void *header_addr = base;
@@ -613,12 +613,14 @@ static void spe_disable_cpu(void *info)
 }
 
 #if CONFIG_PERF_OPTIMISED < 2
-static void update_stats_arr(unsigned long long ts_before_process) 
+static inline void update_stats_arr(unsigned long long ts_before_process) 
 {
 	unsigned long long ts_after_process;
 	unsigned long long stats_arr_i;
 
 	read_records++;
+	dsb(ish);
+	isb();
 	ts_after_process = READ_CNTCPT_EL0();
 	stats_arr_i = read_records & (NUM_STATS_RECORDS-1);
 	ts_stats_arr[stats_arr_i].spe_reader_delay = 
@@ -628,12 +630,48 @@ static void update_stats_arr(unsigned long long ts_before_process)
 	timestamp_delta = timestamp_delta 
 				+ (ts_before_process - last_ts);
 }
+
+static inline unsigned long get_exact_cntpct(void)
+{
+	unsigned long cntpct;
+
+	dsb(ish);
+	isb();
+	cntpct = READ_CNTCPT_EL0();
+	dsb(ish);
+	isb();
+	return cntpct;
+}
 #else
 static void update_stats_arr(unsigned long long ts_before_process)
 {
 	return;
 }
+
+static unsigned long get_exact_cntpct(void)
+{
+	return 0;
+}
+
 #endif
+
+static void swap_spe_buffers(struct core_info *cinfo)
+{
+	cinfo->active_buffer = OTHER_BUFFER(cinfo->active_buffer);
+	SWAP(cinfo->primary.buf,cinfo->secondary.buf);
+	SWAP(cinfo->primary.limit,cinfo->secondary.limit);
+	SWAP(cinfo->primary.watermark,cinfo->secondary.watermark);
+	smp_wmb();
+	cinfo->secondary.ready = 0;
+}
+
+static inline void request_buffer_maintenance(struct spe_ctrl *s, int cpu)
+{
+	int ret = smp_call_function_single(cpu, spe_bw_manage_buffer, s, 0);
+	if(ret != 0)
+		pr_warn("error in calling spe_bw_manage_buffer");
+
+}
 
 static int spe_reader(void *data)
 {
@@ -653,73 +691,39 @@ static int spe_reader(void *data)
 		for_each_cpu(cpu, s->target_cpu){
 			struct core_info * cinfo = per_cpu_ptr(core_info,cpu);
 			/*
-			 * spe_buf::limit can change out of the control of 
+			 * spe_buf::limit can change out of the control of
 			 * current thread's control.
 			*/
 			void *limit = READ_ONCE(cinfo->primary.limit);
+			u64 next_to_read = READ_ONCE(*(u64 *)(cinfo->primary.buf + s->advance));
 			//TODO: evaluate this barrier, maybe it can be removed
 			smp_rmb();
-			if (cinfo->primary.buf < limit && 
-				READ_ONCE(
-					*(u64 *)(cinfo->primary.buf + s->advance)
-				) 
-				!= ones_mask) 
+			if (cinfo->primary.buf < limit &&
+				next_to_read != ones_mask)
 			{
-
 				pr_debug("SPE record at %llx\n",(u64) cinfo->primary.buf);
-#if CONFIG_PERF_OPTIMISED < 2
-				dsb(ish);
-				isb();
-				ts_before_process = READ_CNTCPT_EL0();
-				dsb(ish);
-				isb();
-#endif
+
+				ts_before_process = get_exact_cntpct();
+
 				ret = process_record(cinfo->primary.buf);
-				/*
-				* Can be removed because depending on last_ts, 
-				* that is modified as last step inside 
-				* process_record()
-				*/
-#if CONFIG_PERF_OPTIMISED < 2
-				dsb(ish);
-				isb();
-#endif
+
 				if(ret < 0){
 					PR_DEBUG("Unrecognised packet header: %x", (unsigned int)(-ret));
-					return false;
-				} else {
-					cinfo->primary.buf += 64UL;
-					update_stats_arr(ts_before_process);
-					//With the equal comparison, it will only trigger once
-					if (cinfo->primary.buf == cinfo->primary.watermark ){
-						pr_debug("spe_reader():watermark hit\n");
-						if(0 != smp_call_function_single(cpu,
-							spe_bw_manage_buffer,
-							s, 0))
-						{				
-							pr_warn("error in calling " 
-								"spe_bw_manage_buffer");
-						}	
-						
-					}
+					return -1;
+				}
+				cinfo->primary.buf += 64UL;
+				update_stats_arr(ts_before_process);
+
+				//With the equal comparison, it will only trigger once
+				if (cinfo->primary.buf == cinfo->primary.watermark ) {
+					pr_debug("spe_reader():watermark hit\n");
+					request_buffer_maintenance(s,cpu);
 				}
 			}
-		
+
 			// Restore a waiting buffer, if the secondary is ready
-			if(cinfo->primary.buf == limit && 
-				READ_ONCE(cinfo->secondary.ready))
-			{
-				cinfo->active_buffer = OTHER_BUFFER(cinfo->active_buffer);
-				SWAP(cinfo->primary.buf,cinfo->secondary.buf);
-				SWAP(cinfo->primary.limit,cinfo->secondary.limit);
-				SWAP(cinfo->primary.watermark,cinfo->secondary.watermark);
-				smp_wmb();
-				cinfo->secondary.ready = 0;
-				// cinfo->primary
-				// s->buf = s->secondary_buf;
-				// s->limit = s->secondary_limit;
-				// s->water_mark = s->secondary_watermark;
-			}
+			if(cinfo->primary.buf == limit && READ_ONCE(cinfo->secondary.ready))
+				swap_spe_buffers(cinfo);
 		}
 		cpu_relax();
 	}
