@@ -40,6 +40,7 @@
 #include <asm/sysreg.h>
 
 #include "spe_ring.h"
+#include "gic-v3-dump.h"
 
 #define STR_BUFFER_LEN 255
 //TODO: this should be a module parameter
@@ -373,6 +374,7 @@ static void spe_bw_manage_buffer(void *info)
 	struct core_info *cinfo = this_cpu_ptr(core_info);
 	void* secondary_buf,*secondary_limit;
 	u64 reg;
+	bool syndrome_set;
 
 	spe_bw_management_called[cpu]++;
 	pr_debug("Management function triggered on cpu %d", cpu);
@@ -393,11 +395,18 @@ static void spe_bw_manage_buffer(void *info)
 	}
 	// Mask COLL as we already checked it
 	reg = reg & ~BIT(SYS_PMBSR_EL1_COLL_SHIFT);
+	if (reg & BIT(SYS_PMBSR_EL1_S_SHIFT)) {
+		syndrome_set = true;
+		bsp_irq_dump();
+	}
 	if(reg != 0){
 		pr_warn("spe_bw_manage_buffer(): SYS_PMBSR_EL1: %llx",reg);
 	} 
 
 	write_sysreg_s(0, SYS_PMBSR_EL1);
+
+	if (syndrome_set)
+		bsp_irq_dump();
 
 	//Allocate secondary_buffer
 	secondary_buf = cinfo->buffer_base
@@ -1251,7 +1260,14 @@ static int spe_bw_device_probe(struct platform_device *pdev)
 		"ring capacity=%u\n",
 		ring_entries);
 
+	ret = init_irq_dump();
+	if (ret)
+		goto spe_ring_dereg;
+
 	return 0;
+
+spe_ring_dereg:
+	spe_ring_dev_deregister(spe_ctrl->spe_ring);
 
 free_irq:
 	free_percpu_irq(spe_ctrl->irq, spe_ctrl);
@@ -1272,6 +1288,7 @@ static int spe_bw_device_remove(struct platform_device *pdev)
 {
 	struct spe_ctrl *spe_ctrl = platform_get_drvdata(pdev);
 	pr_info("Hello from remove\n");
+	free_irq_dump();
 	//arm_spe_pmu_perf_destroy(spe_ctrl);
 	//arm_spe_pmu_dev_teardown(spe_ctrl);
 	free_percpu_irq(spe_ctrl->irq, spe_ctrl);
