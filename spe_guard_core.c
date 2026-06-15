@@ -49,6 +49,7 @@
 #define WATERMARK_NUM 1
 #define WATERMARK_DEN 2
 #define CONFIG_PERF_OPTIMISED 1
+#define CONFIG_SAMPLE_TS_VADDR
 #define PKT_PAYLOAD_SZ_MASK (0x3)
 #define PKT_PAYLOAD_SZ_SHIFT (4)
 #define SYS_PMSCR_EL1_EE_SHIFT	8
@@ -233,6 +234,7 @@ struct ts_stats{
 };
 static struct ts_stats *ts_stats_arr;
 static unsigned int ring_entries = 65536;
+static unsigned long overflowed_samples;
 //struct kobj_attribute etx_attr = __ATTR(etx_value, 0660, sysfs_show, sysfs_store);
 /**************************************************************************
  * Local Function Prototypes
@@ -315,7 +317,7 @@ static u64 spe_bw_fill_pmscr(void)
 	return reg;
 }
 
-static u64 spe_bw_get_record_timestamp(void *payload_addr){
+static inline u64 spe_bw_get_record_timestamp(void *payload_addr){
 	u64 timestamp;
 	if(likely(((u64)payload_addr & (0x7U)) == 0U)){
 		timestamp = *(u64 *)payload_addr;
@@ -323,6 +325,27 @@ static u64 spe_bw_get_record_timestamp(void *payload_addr){
 		timestamp = get_unaligned((u64 *)payload_addr);
 	}
 	return timestamp;
+}
+
+static inline u64 spe_bw_get_record_vaddr(void *payload_addr){
+	u64 vaddr;
+	if(likely(((u64)payload_addr & (0x7U)) == 0U)){
+		vaddr = *(u64 *)payload_addr;
+	}else{
+		vaddr = get_unaligned((u64 *)payload_addr);
+	}
+	return vaddr;
+}
+
+static inline u64 spe_bw_get_record_pc(void *payload_addr){
+	u64 pc;
+	if(likely(((u64)payload_addr & (0x7U)) == 0U)){
+		pc = *(u64 *)payload_addr;
+	}else{
+		pc = get_unaligned((u64 *)payload_addr);
+	}
+	pc &= ~(0xffUL << 56);
+	return pc;
 }
 
 /*
@@ -398,7 +421,36 @@ static void spe_bw_manage_buffer(void *info)
 	
 }
 
-static inline int process_record(void *base)
+#ifdef CONFIG_SAMPLE_TS_VADDR
+static inline void fill_sample_cur_ts(struct sample *s)
+{
+	s->timestamp_module = READ_CNTCPT_EL0();
+}
+
+static inline void fill_sample_ts_spe(struct sample *s, u64 timestamp)
+{
+	s->timestamp_spe = timestamp;
+}
+
+static inline void fill_sample_pc(struct sample *s, void *payload_addr)
+{
+	
+	s->pc = spe_bw_get_record_pc(payload_addr);
+}
+
+static inline void fill_sample_vaddr(struct sample *s, void *payload_addr)
+{
+	s->vaddr = spe_bw_get_record_vaddr(payload_addr);
+}
+
+#else
+static inline void fill_sample_cur_ts(struct sample *s){}
+static inline void fill_sample_ts_spe(struct sample *s, u64 timestamp){}
+static inline void fill_sample_pc(struct sample *s, void *payload_addr){}
+static inline void fill_sample_vaddr(struct sample *s, void *payload_addr){}
+#endif
+
+static inline int process_record(void *base, struct sample *s)
 {
 	bool end = false;
 	void *header_addr = base;
@@ -412,6 +464,7 @@ static inline int process_record(void *base)
 	unsigned int packets_found = 0;
 	string_buffer[0] = '\0';
 #endif
+	fill_sample_cur_ts(s);
 	while(header_addr < (base + 64UL) && !end){
 		header = READ_ONCE(*(u8 *)header_addr);
 		header_size = 1;
@@ -453,6 +506,7 @@ static inline int process_record(void *base)
 #if CONFIG_PERF_OPTIMISED == 0
 				PR_TRACE("%s",string_buffer);
 #endif
+				fill_sample_ts_spe(s, timestamp);
 				last_ts = timestamp;
 				end = true;
 				break;
@@ -481,8 +535,14 @@ static inline int process_record(void *base)
 				pr_info_concat("OP type packet (%d B), ", payload_size);
 				break;
 			case PKT_ADDR_SH_PC:
-			case PKT_ADDR_SH_B_TARGET:
+				fill_sample_pc(s, header_addr+1);
+				pr_info_concat("Address packet (%d B), ", payload_size);
+				break;
 			case PKT_ADDR_SH_ACC_VA:
+				fill_sample_vaddr(s, header_addr+1);
+				pr_info_concat("Address packet (%d B), ", payload_size);
+				break;
+			case PKT_ADDR_SH_B_TARGET:
 			case PKT_ADDR_SH_ACC_PA:
 			case PKT_ADDR_SH_RES0:
 			case PKT_ADDR_SH_RES1:
@@ -684,6 +744,7 @@ static bool try_read_record(struct spe_ctrl *s,
 	unsigned long long ts_before_process;
 	u64 ones_mask = ~0x0; // This should make an all ones mask
 	struct core_info * cinfo = per_cpu_ptr(core_info,cpu);
+	struct sample sample = {0};
 	/*
 		* spe_buf::limit can change out of the control of
 		* current thread's control.
@@ -699,7 +760,7 @@ static bool try_read_record(struct spe_ctrl *s,
 
 		ts_before_process = get_exact_cntpct();
 
-		ret = process_record(cinfo->primary.buf);
+		ret = process_record(cinfo->primary.buf, &sample);
 
 		if(ret < 0){
 			PR_DEBUG("Unrecognised packet header: %x", (unsigned int)(-ret));
@@ -707,6 +768,9 @@ static bool try_read_record(struct spe_ctrl *s,
 		}
 		cinfo->primary.buf += 64UL;
 		update_stats_arr(ts_before_process);
+
+		if (spe_ring_push_sample_try(&(s->spe_ring[cpu]), sample) != 0)
+			overflowed_samples++;
 
 		//With the equal comparison, it will only trigger once
 		if (cinfo->primary.buf == cinfo->primary.watermark ) {
@@ -786,7 +850,8 @@ static ssize_t sysfs_store_control(struct kobject *kobj,
 		read_records = 0;
 		precess_record_time = 0;
 		first_ts = 0;
-		
+		overflowed_samples = 0;
+
 		spe.size = BUFFER_SIZE;
 		for_each_cpu(i, spe.target_cpu){
 			struct core_info *cinfo = per_cpu_ptr(core_info,i);
@@ -897,6 +962,7 @@ static ssize_t sysfs_store_control(struct kobject *kobj,
 				proc_delay_avg, proc_delay_err);
 		}
 #endif
+		PR_DEBUG("Total number of overflowed samples:%ld\n",overflowed_samples);
 	}
 
 	return count;
