@@ -39,6 +39,8 @@
 #include <asm/mmu.h>
 #include <asm/sysreg.h>
 
+#include "spe_ring.h"
+
 #define STR_BUFFER_LEN 255
 //TODO: this should be a module parameter
 
@@ -194,6 +196,7 @@ struct spe_ctrl {
 
 	struct task_struct *reader_task;
 	struct platform_device *pdev;
+	struct spe_ring_dev *spe_ring;
 	bool running;
 };
 
@@ -229,6 +232,7 @@ struct ts_stats{
 	unsigned int reader_process_delay;
 };
 static struct ts_stats *ts_stats_arr;
+static unsigned int ring_entries = 65536;
 //struct kobj_attribute etx_attr = __ATTR(etx_value, 0660, sysfs_show, sysfs_store);
 /**************************************************************************
  * Local Function Prototypes
@@ -323,8 +327,8 @@ static u64 spe_bw_get_record_timestamp(void *payload_addr){
 
 /*
  * Run in interrupt, stops SPE on a buffer, and restarts it on the secondary.
- * It sets primary limit to the point where 
- * When spe_reader  
+ * It sets primary limit to the point where SPE HW effectively wrote
+ * When spe_reader gets to new limit, performs buffer swap
 */
 static void spe_bw_manage_buffer(void *info)
 {
@@ -1114,8 +1118,19 @@ static int spe_bw_device_probe(struct platform_device *pdev)
 	// ret = arm_spe_pmu_dev_init(spe_pmu);
 	// if (ret)
 	// 	goto out_free_handle;
+	ret = spe_ring_dev_register(&spe_ctrl->spe_ring, ring_entries);
+	if (ret) {
+		goto free_irq;
+	}
+
+	dev_info(&pdev->dev,
+		"ring capacity=%u\n",
+		ring_entries);
 
 	return 0;
+
+free_irq:
+	free_percpu_irq(spe_ctrl->irq, spe_ctrl);
 
 //out_teardown_dev:
 	// Again, only when will allocate here 
@@ -1137,6 +1152,7 @@ static int spe_bw_device_remove(struct platform_device *pdev)
 	//arm_spe_pmu_dev_teardown(spe_ctrl);
 	free_percpu_irq(spe_ctrl->irq, spe_ctrl);
 	//free_percpu(spe_ctrl->handle);
+	spe_ring_dev_deregister(spe_ctrl->spe_ring);
 	return 0;
 }
 
@@ -1391,6 +1407,10 @@ static void __exit spe_guard_exit(void)
 // Register the functions
 module_init(spe_guard_init);
 module_exit(spe_guard_exit);
+
+module_param(ring_entries, uint, 0444);
+MODULE_PARM_DESC(ring_entries,
+		 "Number of entries in ring buffer");
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("SPE based Memeguard Implementation");
