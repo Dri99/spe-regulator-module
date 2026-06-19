@@ -49,7 +49,6 @@
 #define WATERMARK_NUM 1
 #define WATERMARK_DEN 2
 #define CONFIG_PERF_OPTIMISED 1
-#define CONFIG_SAMPLE_TS_VADDR
 #define PKT_PAYLOAD_SZ_MASK (0x3)
 #define PKT_PAYLOAD_SZ_SHIFT (4)
 #define SYS_PMSCR_EL1_EE_SHIFT	8
@@ -352,6 +351,16 @@ static inline u64 spe_bw_get_record_pc(void *payload_addr){
 	return pc;
 }
 
+static inline u32 spe_bw_get_record_counter(void *payload_addr){
+	u32 counter;
+	if(likely(((u64)payload_addr & (0x3U)) == 0U)){
+		counter = *(u32 *)payload_addr;
+	}else{
+		counter = get_unaligned((u32 *)payload_addr);
+	}
+	return counter;
+}
+
 /*
  * Run in interrupt, stops SPE on a buffer, and restarts it on the secondary.
  * It sets primary limit to the point where SPE HW effectively wrote
@@ -435,7 +444,12 @@ static inline void fill_sample_ts_spe(struct sample *s, u64 timestamp)
 {
 	s->timestamp_spe = timestamp;
 }
+#else
+static inline void fill_sample_cur_ts(struct sample *s){}
+static inline void fill_sample_ts_spe(struct sample *s, u64 timestamp){}
+#endif
 
+#ifdef CONFIG_SAMPLE_VADDR
 static inline void fill_sample_pc(struct sample *s, void *payload_addr)
 {
 	
@@ -448,12 +462,41 @@ static inline void fill_sample_vaddr(struct sample *s, void *payload_addr)
 }
 
 #else
-static inline void fill_sample_cur_ts(struct sample *s){}
-static inline void fill_sample_ts_spe(struct sample *s, u64 timestamp){}
 static inline void fill_sample_pc(struct sample *s, void *payload_addr){}
 static inline void fill_sample_vaddr(struct sample *s, void *payload_addr){}
 #endif
 
+#ifdef CONFIG_SAMPLE_LAT
+static inline void fill_sample_issue_lat(struct sample *s, void *payload_addr)
+{
+	s->issue_lat = spe_bw_get_record_counter(payload_addr);
+}
+static inline void fill_sample_total_lat(struct sample *s, void *payload_addr)
+{
+	s->total_lat = spe_bw_get_record_counter(payload_addr);
+}
+static inline void fill_sample_xlat_lat(struct sample *s, void *payload_addr)
+{
+	s->xlat_lat = spe_bw_get_record_counter(payload_addr);
+}
+#else
+static inline void fill_sample_issue_lat(struct sample *s, void *payload_addr){}
+static inline void fill_sample_total_lat(struct sample *s, void *payload_addr){}
+static inline void fill_sample_xlat_lat(struct sample *s, void *payload_addr){}
+#endif
+
+#ifdef CONFIG_SAMPLE_FULL_RECORD
+static inline void fill_sample_full_record(void *base, struct sample *s)
+{
+	__uint128_t  *record_base = base; 
+	s->record[0] = record_base[0];
+	s->record[1] = record_base[1];
+	s->record[2] = record_base[2];
+	s->record[3] = record_base[3];
+}
+#else
+static inline void fill_sample_full_record(void *base, struct sample *s){}
+#endif
 static inline int process_record(void *base, struct sample *s)
 {
 	bool end = false;
@@ -555,8 +598,17 @@ static inline int process_record(void *base, struct sample *s)
 				pr_info_concat("Address packet (%d B), ", payload_size);
 				break;
 			case PKT_CNT_SH_TOT_LAT:
+				fill_sample_total_lat(s, header_addr+1);
+				pr_info_concat("Counter packet (%d B), ", payload_size);
+				break;
 			case PKT_CNT_SH_ISSUE_LAT:
+				fill_sample_issue_lat(s, header_addr+1);
+				pr_info_concat("Counter packet (%d B), ", payload_size);
+				break;
 			case PKT_CNT_SH_XLAT:
+				fill_sample_xlat_lat(s, header_addr+1);
+				pr_info_concat("Counter packet (%d B), ", payload_size);
+				break;
 			case PKT_CNT_SH_RES0:
 			case PKT_CNT_SH_RES1:
 			case PKT_CNT_SH_RES2:
@@ -770,6 +822,8 @@ static bool try_read_record(struct spe_ctrl *s,
 			PR_DEBUG("Unrecognised packet header: %x", (unsigned int)(-ret));
 			return -1;
 		}
+		
+		fill_sample_full_record(cinfo->primary.buf, &sample);
 		cinfo->primary.buf += 64UL;
 		update_stats_arr(ts_before_process);
 

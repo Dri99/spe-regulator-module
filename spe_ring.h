@@ -6,12 +6,34 @@
 #include <linux/spinlock.h>
 #include <linux/types.h>
 
+// #define CONFIG_SAMPLE_TS
+// #define CONFIG_SAMPLE_VADDR
+// #define CONFIG_SAMPLE_LAT
+//#define CONFIG_SAMPLE_FULL_RECORD
 
 struct sample {
+#ifdef CONFIG_SAMPLE_TS
 	u64 timestamp_module;
 	u64 timestamp_spe;
+#endif //CONFIG_SAMPLE_TS
+#ifdef CONFIG_SAMPLE_VADDR	
 	u64 pc;
 	u64 vaddr;
+#endif //CONFIG_SAMPLE_VADDR
+#ifdef CONFIG_SAMPLE_LAT
+	u32 issue_lat;
+	u32 total_lat;
+	u32 xlat_lat;
+#endif //CONFIG_SAMPLE_LAT
+#ifdef CONFIG_SAMPLE_FULL_RECORD
+	__uint128_t  record[64 / sizeof(__uint128_t )];
+#endif //CONFIG_SAMPLE_FULL_RECORD
+#if !defined(CONFIG_SAMPLE_TS) 			\
+	&&  !defined(CONFIG_SAMPLE_VADDR)	\
+	&&  !defined(CONFIG_SAMPLE_LAT)		\
+	&&  !defined(CONFIG_SAMPLE_FULL_RECORD)
+	u8 pad;
+#endif
 };
 
 struct ring_header {
