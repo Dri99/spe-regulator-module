@@ -235,6 +235,10 @@ struct ts_stats{
 static struct ts_stats *ts_stats_arr;
 static unsigned int ring_entries = 65536;
 static unsigned long overflowed_samples;
+static unsigned int g_profiling_period = SPE_BW_PERIOD;
+static bool g_record_kernel = true;
+static bool g_filt_load = false;
+static bool g_filt_store = false;
 //struct kobj_attribute etx_attr = __ATTR(etx_value, 0660, sysfs_show, sysfs_store);
 /**************************************************************************
  * Local Function Prototypes
@@ -1394,16 +1398,16 @@ static int __init spe_guard_init(void)
 		goto clean_exit;
 	}
 		
-	global->filter_ld = true;
-	global->filter_st = false;
+	global->filter_ld = g_filt_load;
+	global->filter_st = g_filt_store;
 	global->ts_enable = true;
 	global->pa_enable = true;
 	global->pct_enable = true;
 	global->exclude_user = false;
-	global->exclude_kernel = false;
+	global->exclude_kernel = !g_record_kernel;
 	global->cx_enable = true;
 	
-	global->period = SPE_BW_PERIOD;
+	global->period = g_profiling_period;
 	global->advance = 0;
 
 	core_info = alloc_percpu(struct core_info);
@@ -1475,8 +1479,16 @@ module_init(spe_guard_init);
 module_exit(spe_guard_exit);
 
 module_param(ring_entries, uint, 0444);
-MODULE_PARM_DESC(ring_entries,
-		 "Number of entries in ring buffer");
+MODULE_PARM_DESC(ring_entries,"Number of entries in ring buffer");
+module_param(g_profiling_period, uint, 0444);
+MODULE_PARM_DESC(g_profiling_period,"Instructions between each samples");
+module_param(g_record_kernel, bool, 0444);
+MODULE_PARM_DESC(g_record_kernel,"Enable sampling during kernel execution");
+module_param(g_filt_load, bool, 0444);
+MODULE_PARM_DESC(g_filt_load,"Record load instructions");
+module_param(g_filt_store, bool, 0444);
+MODULE_PARM_DESC(g_filt_store,"Record store instructions");
+
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("SPE based Memeguard Implementation");
