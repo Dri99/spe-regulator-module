@@ -45,10 +45,10 @@
 //TODO: this should be a module parameter
 
 #define BUFFER_SIZE (1 << 21)
-#define SPE_BW_PERIOD 256
+#define SPE_BW_PERIOD 512
 #define WATERMARK_NUM 1
 #define WATERMARK_DEN 2
-#define CONFIG_PERF_OPTIMISED 1
+#define CONFIG_PERF_OPTIMISED 2
 #define PKT_PAYLOAD_SZ_MASK (0x3)
 #define PKT_PAYLOAD_SZ_SHIFT (4)
 #define SYS_PMSCR_EL1_EE_SHIFT	8
