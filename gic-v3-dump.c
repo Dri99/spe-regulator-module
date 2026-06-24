@@ -1,6 +1,7 @@
 
 #include <linux/cpumask.h>
 #include <linux/io.h>
+#include <linux/irq.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 
@@ -157,14 +158,20 @@ void bsp_irq_dump(void)
 	pr_info("\n");
 }
 
-void irq_dump_activate_pmbirq(void)
+void irq_dump_activate_pmbirq(int hwirq)
 {
 	u32 ispendr0 = gicr_read32(0, GICR_ISPENDR0);
-	gicr_write32((ispendr0 | (0x1 << 21)), 0, GICR_ISPENDR0);
+	gicr_write32((ispendr0 | (0x1 << hwirq)), 0, GICR_ISPENDR0);
 }
 
 void irq_dump_activate_all_irq(void)
 {
 	u32 isactiver0 = gicr_read32(0, GICR_ISACTIVER0);
 	gicr_write32((isactiver0 | 0xffff0000), 0, GICR_ISACTIVER0);
+}
+
+void irq_dump_print_irq_data(int irq)
+{
+	struct irq_data *data = irq_get_irq_data(irq);
+	pr_info("irq_data::hwirq = %ld\n", data->hwirq);
 }

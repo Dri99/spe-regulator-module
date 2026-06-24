@@ -301,6 +301,7 @@ static int spe_bw_irq_probe(struct spe_ctrl *spe_ctrl)
 
 	spe_ctrl->irq = irq;
 
+	irq_dump_print_irq_data(spe_ctrl->irq);
 	return 0;
 }
 
@@ -380,7 +381,7 @@ static void spe_bw_manage_buffer(void *info)
 	struct core_info *cinfo = this_cpu_ptr(core_info);
 	void* secondary_buf,*secondary_limit;
 	u64 reg;
-	bool syndrome_set;
+	bool syndrome_set = false;
 
 	spe_bw_management_called[cpu]++;
 	pr_debug("Management function triggered on cpu %d", cpu);
@@ -402,6 +403,7 @@ static void spe_bw_manage_buffer(void *info)
 	// Mask COLL as we already checked it
 	reg = reg & ~BIT(SYS_PMBSR_EL1_COLL_SHIFT);
 	if (reg & BIT(SYS_PMBSR_EL1_S_SHIFT)) {
+		pr_info("spe_bw_manage_buffer(): Syndrome set, dumping...");
 		syndrome_set = true;
 		bsp_irq_dump();
 	}
@@ -411,8 +413,10 @@ static void spe_bw_manage_buffer(void *info)
 
 	write_sysreg_s(0, SYS_PMBSR_EL1);
 
-	if (syndrome_set)
+	if (syndrome_set){
+		pr_info("spe_bw_manage_buffer(): Syndrome clear, dumping...");
 		bsp_irq_dump();
+	}
 
 	//Allocate secondary_buffer
 	secondary_buf = cinfo->buffer_base
@@ -672,6 +676,11 @@ static inline int process_record(void *base, struct sample *s)
 	return 0;
 }
 
+void set_syndrome_bit(void)
+{
+	u64 pmbsr = read_sysreg_s(SYS_PMBSR_EL1);
+	write_sysreg_s((pmbsr | BIT(SYS_PMBSR_EL1_S_SHIFT)), SYS_PMBSR_EL1);
+}
 
 static void spe_enable_cpu(void *info)
 {
@@ -723,6 +732,8 @@ static void spe_enable_cpu(void *info)
 	write_sysreg_s(reg, SYS_PMSCR_EL1);
 
 	isb();
+	irq_dump_activate_pmbirq(irqd_to_hwirq(irq_get_irq_data(s->irq)));
+	//set_syndrome_bit();
 	pr_debug("SPE engine started on CPU %d\n",smp_processor_id());
 }
 
