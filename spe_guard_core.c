@@ -53,6 +53,12 @@
 #define PKT_PAYLOAD_SZ_MASK (0x3)
 #define PKT_PAYLOAD_SZ_SHIFT (4)
 #define SYS_PMSCR_EL1_EE_SHIFT	8
+#define ID_AA64PFR0_EL1		sys_reg(3, 0, 0, 4, 0)
+#define ID_AA64PFR1_EL1		sys_reg(3, 0, 0, 4, 1)
+#define ID_AA64PFR2_EL1		sys_reg(3, 0, 0, 4, 2)
+
+#define ID_AA64DFR0_EL1		sys_reg(3, 0, 0, 5, 0)
+#define ID_AA64DFR1_EL1		sys_reg(3, 0, 0, 5, 1)
 #define ID_AA64DFR2_EL1		sys_reg(3, 0, 0, 5, 2)
 
 #define BIT_GET(_fld, _reg) (_reg & BIT(_fld ## _SHIFT))
@@ -1350,7 +1356,14 @@ static int __init spe_guard_init(void)
 
 	reg = read_sysreg_s(SYS_CNTFRQ_EL0);
 	pr_debug("CNTFRQ_EL0=%llu/n",reg);
-	pr_debug("ID_AA64DFR2_EL1=0x%llx",read_sysreg_s(ID_AA64DFR2_EL1));
+	
+	pr_info("ID_AA64PFR0_EL1=0x%llx",read_sysreg_s(ID_AA64PFR0_EL1));
+	pr_info("ID_AA64PFR1_EL1=0x%llx",read_sysreg_s(ID_AA64PFR1_EL1));
+	pr_info("ID_AA64PFR2_EL1=0x%llx",read_sysreg_s(ID_AA64PFR2_EL1));
+
+	pr_info("ID_AA64DFR0_EL1=0x%llx",read_sysreg_s(ID_AA64DFR0_EL1));
+	pr_info("ID_AA64DFR1_EL1=0x%llx",read_sysreg_s(ID_AA64DFR1_EL1));
+	pr_info("ID_AA64DFR2_EL1=0x%llx",read_sysreg_s(ID_AA64DFR2_EL1));
 	pr_debug("Sleeping 100ms...");
 	//reg = read_sysreg_s(cntpct_el0);
 	asm volatile("mrs %0, cntpct_el0" : "=r" (reg));
