@@ -12,7 +12,7 @@ static int spe_ring_alloc(struct spe_ring_dev *ring)
 	struct ring_shared *shared_spe_ring;
 
 	size = sizeof(struct ring_header) +
-		ring->shared_entries * sizeof(struct sample);
+		ring->shared_entries * sizeof(struct ring_elem);
 	pr_info("allocatred shared spe_ring\n");
 	shared_spe_ring = vmalloc_user(size);
 
@@ -41,7 +41,7 @@ static void spe_ring_free(struct spe_ring_dev *ring)
 	shared_ring = ring->shared;
 	ring->shared = NULL;
 	spin_unlock(&ring->shared_lock);
-	pr_err("free shared spe_ring\n");
+	pr_debug("free shared spe_ring\n");
 	if (shared_ring)
 		vfree(shared_ring);
 
@@ -58,7 +58,7 @@ static int spe_ring_mmap(struct file *file,
 	req_size = vma->vm_end - vma->vm_start;
 	allocated_size = PAGE_ALIGN( sizeof(struct ring_header) +
 				dev->shared_entries *
-				sizeof(struct sample));
+				sizeof(struct ring_elem));
 
 	if (req_size > allocated_size)
 		return -EINVAL;
@@ -194,7 +194,7 @@ void spe_ring_dev_deregister(struct spe_ring_dev *spe_rings_arr)
 	return;
 }
 
-int spe_ring_push_sample(struct spe_ring_dev *ring, struct sample s)
+int spe_ring_push_sample(struct spe_ring_dev *ring, const struct ring_elem *s)
 {
 	u64 head;
 	u64 tail;
@@ -219,7 +219,7 @@ int spe_ring_push_sample(struct spe_ring_dev *ring, struct sample s)
 
 	idx = head % ring->shared->hdr.capacity;
 
-	ring->shared->data[idx] = s;
+	ring->shared->data[idx] = *s;
 
 	smp_store_release(
 			&ring->shared->hdr.head,
@@ -230,7 +230,8 @@ int spe_ring_push_sample(struct spe_ring_dev *ring, struct sample s)
 EXPORT_SYMBOL_GPL(spe_ring_push_sample);
 
 // If the ring buffer is full, we immediately return failure
-int spe_ring_push_sample_try(struct spe_ring_dev *ring, struct sample s)
+int spe_ring_push_sample_try(struct spe_ring_dev *ring, 
+				const struct ring_elem *s)
 {
 	u64 head;
 	u64 tail;
@@ -253,7 +254,7 @@ int spe_ring_push_sample_try(struct spe_ring_dev *ring, struct sample s)
 
 	idx = head % ring->shared->hdr.capacity;
 	pr_debug("idx: %llu",idx);
-	ring->shared->data[idx] = s;
+	ring->shared->data[idx] = *s;
 
 	smp_store_release(
 			&ring->shared->hdr.head,

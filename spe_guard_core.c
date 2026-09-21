@@ -22,6 +22,7 @@
 #include <linux/interrupt.h>
 #include <linux/irq.h>
 #include <linux/kernel.h>
+#include <linux/ktime.h>
 #include <linux/list.h>
 #include <linux/module.h>
 #include <linux/of.h>
@@ -174,6 +175,19 @@ struct core_info{
 	*/
 };
 
+struct be_core_info {
+	bool is_throttled;
+	struct irq_work throttled_context;
+};
+
+#define NUM_BINS 100
+#define MAX_TRACKED_LAT 2015
+#define MIN_TRACKED_LAT 15
+#define BIN_WIDTH (unsigned int)((MAX_TRACKED_LAT - MIN_TRACKED_LAT) / NUM_BINS)
+#define WINDOW_SIZE 1000
+#define AGE_FACT_NUM 255
+#define AGE_FACT_DEN 256
+#define DECIMAL_BITS  12
 struct spe_ctrl {
 	size_t size;
 	//interrupts = <0x01 0x05 0x04>;
@@ -197,6 +211,18 @@ struct spe_ctrl {
 	struct task_struct *reader_task;
 	struct platform_device *pdev;
 	struct spe_ring_dev *spe_ring;
+	unsigned int min_tracked_lat;
+	unsigned long long latency_distr[NUM_BINS];
+	unsigned long long prev_cdf[NUM_BINS];
+	unsigned long long cdf_hist[WINDOW_SIZE][NUM_BINS];
+	unsigned int it_win;
+	unsigned int num_samples;
+	//Reference distibution is recorded over a power of 2 number of samples
+	unsigned int reference_distr[NUM_BINS];
+	//TODO: optimize g_ref_num_samples by changing it to power of 2
+	u64 next_regulation_ns;
+	bool throttle_be_cpus;
+	cpumask_var_t be_cpu;
 	bool running;
 };
 
@@ -214,6 +240,7 @@ static const size_t NUM_STATS_RECORDS=1<<(2+20);
  **************************************************************************/
 static struct spe_ctrl spe;
 static struct core_info __percpu *core_info;
+static struct be_core_info __percpu *be_core_info;
 static unsigned int extended_packets = 0;
 
 static struct kobject *spe_kobj;
@@ -238,6 +265,11 @@ static unsigned int g_profiling_period = SPE_BW_PERIOD;
 static bool g_record_kernel = true;
 static bool g_filt_load = false;
 static bool g_filt_store = false;
+static unsigned int g_regulation_period_us = 1000;
+static unsigned long g_reference_cdf[NUM_BINS];
+static unsigned int g_received_bins = 100;
+static unsigned int g_ref_num_samples = 1024;
+static unsigned long long throttled_period, total_period, constant_period;
 //struct kobj_attribute etx_attr = __ATTR(etx_value, 0660, sysfs_show, sysfs_store);
 /**************************************************************************
  * Local Function Prototypes
@@ -248,16 +280,21 @@ static ssize_t sysfs_store_control(struct kobject *kobj, struct kobj_attribute *
 static ssize_t sysfs_store_target_cpu(struct kobject *kobj,
 			     struct kobj_attribute *attr,
 			     const char *buf, size_t count);
+static ssize_t sysfs_store_be_cpu(struct kobject *kobj,
+			     struct kobj_attribute *attr,
+			     const char *buf, size_t count);
 static ssize_t sysfs_store_reader_cpu(struct kobject *kobj,
 			     struct kobj_attribute *attr,
 			     const char *buf, size_t count);
 
 static struct kobj_attribute control_attr = __ATTR(control, 0664, NULL,
-							 sysfs_store_control);
-static struct kobj_attribute reader_cpu_attr =  __ATTR(reader_cpu, 0664, NULL, 
-							sysfs_store_reader_cpu);
-static struct kobj_attribute target_cpu_attr = __ATTR(target_cpu, 0664, NULL, 
+							sysfs_store_control);
+static struct kobj_attribute target_cpu_attr = __ATTR(target_cpu, 0664, NULL,
 							sysfs_store_target_cpu);
+static struct kobj_attribute be_cpu_attr = __ATTR(be_cpu, 0664, NULL,
+							sysfs_store_be_cpu);
+static struct kobj_attribute reader_cpu_attr =  __ATTR(reader_cpu, 0664, NULL,
+							sysfs_store_reader_cpu);
 
 
 /**************************************************************************
@@ -351,12 +388,12 @@ static inline u64 spe_bw_get_record_pc(void *payload_addr){
 	return pc;
 }
 
-static inline u32 spe_bw_get_record_counter(void *payload_addr){
-	u32 counter;
-	if(likely(((u64)payload_addr & (0x3U)) == 0U)){
-		counter = *(u32 *)payload_addr;
+static inline u16 spe_bw_get_record_counter(void *payload_addr){
+	u16 counter;
+	if(likely(((u64)payload_addr & (0x1U)) == 0U)){
+		counter = *(u16 *)payload_addr;
 	}else{
-		counter = get_unaligned((u32 *)payload_addr);
+		counter = get_unaligned((u16 *)payload_addr);
 	}
 	return counter;
 }
@@ -485,18 +522,6 @@ static inline void fill_sample_total_lat(struct sample *s, void *payload_addr){}
 static inline void fill_sample_xlat_lat(struct sample *s, void *payload_addr){}
 #endif
 
-#ifdef CONFIG_SAMPLE_FULL_RECORD
-static inline void fill_sample_full_record(void *base, struct sample *s)
-{
-	__uint128_t  *record_base = base; 
-	s->record[0] = record_base[0];
-	s->record[1] = record_base[1];
-	s->record[2] = record_base[2];
-	s->record[3] = record_base[3];
-}
-#else
-static inline void fill_sample_full_record(void *base, struct sample *s){}
-#endif
 static inline int process_record(void *base, struct sample *s)
 {
 	bool end = false;
@@ -682,6 +707,7 @@ static void spe_enable_cpu(void *info)
 
 	write_sysreg_s(reg, SYS_PMSFCR_EL1);
 
+	//TODO: to add SYS_PMSLATFR_EL1 filtering
 	// Set Interval counter
 	reg = 0;
 	//reg |= FIELD_SET_LOCAL(SYS_PMSIRR_EL1_INTERVAL, s->period);
@@ -792,6 +818,240 @@ static inline void request_buffer_maintenance(struct spe_ctrl *s, int cpu)
 		pr_warn("error in calling spe_bw_manage_buffer");
 
 }
+ 
+
+static void bin_sample(struct spe_ctrl *s, struct sample *sample)
+{
+	unsigned int exec_lat;
+	unsigned int idx_bin;
+	// pr_info("Tot:%d, Issue:%d, xlat:%d", sample->total_lat,sample->issue_lat,sample->xlat_lat);
+	if(sample->issue_lat >= 4095 || sample->total_lat >= 4095)
+		exec_lat = 4096 + sample->xlat_lat;
+	else
+		exec_lat = sample->total_lat - sample->issue_lat - sample->xlat_lat;
+
+	if( exec_lat < s->min_tracked_lat)
+		return;
+	// Value equal to bin counts in bin, value higher counts in next 
+	if (exec_lat == s->min_tracked_lat )
+		idx_bin = 0;
+	else
+		idx_bin = (exec_lat - s->min_tracked_lat - 1) / BIN_WIDTH + 1;
+#ifdef CONFIG_AGING_WIN
+	if(idx_bin < NUM_BINS)
+		s->latency_distr[idx_bin] += (1 << DECIMAL_BITS);
+	else
+		s->latency_distr[NUM_BINS - 1] += (1 << DECIMAL_BITS);
+
+	s->num_samples += (1 << DECIMAL_BITS);
+#else
+	if(idx_bin < NUM_BINS)
+		s->latency_distr[idx_bin]++;
+	else
+		s->latency_distr[NUM_BINS - 1]++;
+
+	s->num_samples++;
+#endif
+	
+	//TODO: what to do with overflowing ones?
+	//TODO: better with manual bins
+	//TODO: evalaute manual bins to have least difference between square and
+	//	function
+}
+
+static void throttle_thread(void* info)
+{
+	struct spe_ctrl *s = info;
+	struct be_core_info *cinfo = this_cpu_ptr(be_core_info);
+	WRITE_ONCE(cinfo->is_throttled, true);
+	while(READ_ONCE(s->throttle_be_cpus)) {
+		smp_mb();
+		cpu_relax();
+	}
+	WRITE_ONCE(cinfo->is_throttled, false);
+	//TODO: should switch to softirq, but we already have reader_cpu stuck in hard irq
+}
+
+static void throttle_thread_soft(struct irq_work *entry) {
+	//TODO: To be done
+}
+
+#ifdef CONFIG_AGING_WIN
+static void post_regulation(struct spe_ctrl *s)
+{
+	unsigned int i;
+	for (i = 0; i < NUM_BINS; i++)
+		s->latency_distr[i] = s->latency_distr[i] * AGE_FACT_NUM / AGE_FACT_DEN;
+	s->num_samples = s->num_samples * AGE_FACT_NUM / AGE_FACT_DEN;
+}
+#elif defined(CONFIG_DELETE_HISTORY)
+static void post_regulation(struct spe_ctrl *s)
+{
+	unsigned int i;
+	for (i = 0; i < NUM_BINS; i++)
+		s->latency_distr[i] = 0;
+	s->num_samples = 0;
+}
+#else
+static void post_regulation(struct spe_ctrl *s) {}
+#endif
+
+
+#if CONFIG_PERF_OPTIMISED < 2
+#define CDF_PRINT_LEN 1000
+static char str_buf[CDF_PRINT_LEN];
+int concat_cdf_value(char * buffer, unsigned long long value)
+{
+	return snprintf(buffer, CDF_PRINT_LEN-(buffer-str_buf)-1, "%lld,", value);
+}
+#else 
+char str_buf[] = {'\0'};
+int concat_cdf_value(char * buffer, unsigned long long value)
+{
+	return 0;
+}
+#endif
+#ifdef CONFIG_REG_FULL_HIST 
+static void evaluate_regulation(struct spe_ctrl *s)
+{
+	unsigned long long observed_cdf[NUM_BINS];
+	unsigned int i;
+	bool throttle_cores = false;
+	char *local_buf = str_buf;
+
+	total_period++;
+	observed_cdf[0] = s->latency_distr[0];
+	for(i = 1; i < NUM_BINS ; i++){
+		observed_cdf[i] = observed_cdf[i-1] + s->latency_distr[i];
+		local_buf += concat_cdf_value(local_buf, observed_cdf[i]);
+	}
+	PR_TRACE("CDF now: %s",str_buf);
+
+	//Check FOSD
+	for(i = 0; i < NUM_BINS ; i++) {
+		//Should divide each CDF by num of samples, but instead we multiply by the other's divisor
+		if(observed_cdf[i] * g_ref_num_samples < 
+			g_reference_cdf[i] * s->num_samples) {
+			throttle_cores = true;
+			PR_TRACE("FOSD violate %lld over %d < %ld over %d at %d", 
+					observed_cdf[i],s->num_samples,
+					g_reference_cdf[i],g_ref_num_samples,
+					i*BIN_WIDTH + MIN_TRACKED_LAT
+					);
+			break;
+		}
+	}
+	
+	if (throttle_cores && READ_ONCE(s->throttle_be_cpus)) {
+		// Do nothing, keep waiting
+		constant_period++;
+		throttled_period++;
+	} else if (throttle_cores && !READ_ONCE(s->throttle_be_cpus)) {
+		throttled_period++;
+		WRITE_ONCE(s->throttle_be_cpus, true);
+		for_each_cpu(i, s->be_cpu){
+			smp_call_function_single(i,
+					throttle_thread,
+					s, 0);
+		}
+
+	} else {
+		WRITE_ONCE(s->throttle_be_cpus, false);
+		if (s->throttle_be_cpus) {
+		} else {
+			constant_period++;
+		}
+	}
+
+	post_regulation(s);
+}
+#endif 
+
+#ifdef CONFIG_SLIDING_WIN
+static void evaluate_regulation(struct spe_ctrl *s)
+{
+	unsigned int i;
+	unsigned int num_samples;
+	bool throttle_cores = false;
+	char *local_buf = str_buf;
+
+	total_period++;
+	for(i = 0; i < NUM_BINS ; i++){
+		s->prev_cdf[i] -= s->cdf_hist[s->it_win][i];
+		s->cdf_hist[s->it_win][i] = 0;
+	}
+
+	s->cdf_hist[s->it_win][0] = s->latency_distr[0];
+	s->prev_cdf[0] += s->cdf_hist[s->it_win][0];
+	for(i = 1; i < NUM_BINS ; i++){
+		s->cdf_hist[s->it_win][i] = s->cdf_hist[s->it_win][i-1] + s->latency_distr[i];
+		s->prev_cdf[i] += s->cdf_hist[s->it_win][i];
+		local_buf += concat_cdf_value(local_buf, s->prev_cdf[i]);
+	}
+	PR_TRACE("CDF now: %s",str_buf);
+
+	num_samples = s->prev_cdf[NUM_BINS-1];
+	//Check FOSD
+	for(i = 0; i < NUM_BINS ; i++) {
+		/*
+		 * Should divide each CDF by num of samples, but instead we 
+		 * multiply by the other's divisor
+		 */
+		if(s->prev_cdf[i] * g_ref_num_samples < 
+			g_reference_cdf[i] * num_samples) {
+			throttle_cores = true;
+			PR_TRACE("FOSD violate %lld over %d < %ld over %d at %d", 
+					s->prev_cdf[i],s->num_samples,
+					g_reference_cdf[i],g_ref_num_samples,
+					i*BIN_WIDTH + MIN_TRACKED_LAT
+					);
+			break;
+		}
+	}
+	
+	if (throttle_cores && READ_ONCE(s->throttle_be_cpus)) {
+		// Do nothing, keep waiting
+		constant_period++;
+		throttled_period++;
+	} else if (throttle_cores && !READ_ONCE(s->throttle_be_cpus)) {
+		throttled_period++;
+		WRITE_ONCE(s->throttle_be_cpus, true);
+		for_each_cpu(i, s->be_cpu){
+			smp_call_function_single(i,
+					throttle_thread,
+					s, 0);
+		}
+
+	} else {
+		WRITE_ONCE(s->throttle_be_cpus, false);
+		if (s->throttle_be_cpus) {
+		} else {
+			constant_period++;
+		}
+	}
+	s->it_win = (s->it_win + 1) % WINDOW_SIZE;
+	post_regulation(s);
+}
+#endif
+
+static bool should_regulate(struct spe_ctrl *s)
+{
+	return (ktime_get_boottime_ns() >= s->next_regulation_ns);
+}
+
+static void init_next_period(struct spe_ctrl *s)
+{
+
+	s->next_regulation_ns = ktime_get_boottime_ns() + 
+				NSEC_PER_USEC * g_regulation_period_us;
+	pr_info("Starting at: %lld", ktime_get_boottime_ns());
+	pr_info("Next period: %lld", s->next_regulation_ns);
+}
+
+static void set_next_period(struct spe_ctrl *s)
+{
+	s->next_regulation_ns += NSEC_PER_USEC * g_regulation_period_us;
+}
 
 static bool try_read_record(struct spe_ctrl *s,
 				unsigned int cpu)
@@ -801,6 +1061,7 @@ static bool try_read_record(struct spe_ctrl *s,
 	u64 ones_mask = ~0x0; // This should make an all ones mask
 	struct core_info * cinfo = per_cpu_ptr(core_info,cpu);
 	struct sample sample = {0};
+	struct ring_elem *elem;
 	/*
 		* spe_buf::limit can change out of the control of
 		* current thread's control.
@@ -822,12 +1083,14 @@ static bool try_read_record(struct spe_ctrl *s,
 			PR_DEBUG("Unrecognised packet header: %x", (unsigned int)(-ret));
 			return -1;
 		}
-		
-		fill_sample_full_record(cinfo->primary.buf, &sample);
+
+		elem = cinfo->primary.buf;
 		cinfo->primary.buf += 64UL;
 		update_stats_arr(ts_before_process);
 
-		if (spe_ring_push_sample_try(&(s->spe_ring[cpu]), sample) != 0)
+		bin_sample(s, &sample);
+
+		if (spe_ring_push_sample_try(&(s->spe_ring[cpu]), elem) != 0)
 			overflowed_samples++;
 
 		//With the equal comparison, it will only trigger once
@@ -850,7 +1113,7 @@ static int spe_reader(void *data)
 	bool at_least_one_reading = true;
 
 	pr_info("spe_reader(): Starting on CPU %d\n", smp_processor_id());
-
+	init_next_period(s);
 
 	while (at_least_one_reading || !kthread_should_stop() ) {
 		at_least_one_reading = false;
@@ -859,8 +1122,16 @@ static int spe_reader(void *data)
 			if(try_read_record(s, cpu))
 				at_least_one_reading = true;
 		}
+
+		if(should_regulate(s)) {
+			evaluate_regulation(s);
+			set_next_period(s);
+		}
+
 		cpu_relax();
 	}
+	PR_TRACE("Last period: %lld", s->next_regulation_ns);
+	PR_TRACE("Current time: %lld", ktime_get_boottime_ns());
 	pr_info("spe_reader(): stopped on CPU %d\n", smp_processor_id());
 	return 0;
 }
@@ -899,7 +1170,7 @@ static ssize_t sysfs_store_control(struct kobject *kobj,
 {	
 	// Resetting extended packets counter;
 	bool alloc_failed = false;
-	unsigned int i;
+	unsigned int i,j;
 	extended_packets = 0;
 	if (sysfs_streq(buf, "start")) {
 		if (spe.running)
@@ -910,7 +1181,26 @@ static ssize_t sysfs_store_control(struct kobject *kobj,
 		first_ts = 0;
 		overflowed_samples = 0;
 
+		throttled_period = 0;
+		total_period = 0;
+		constant_period = 0;
+
+		spe.it_win = 0;
 		spe.size = BUFFER_SIZE;
+		for(i = 0; i < NUM_BINS; i++) {
+			spe.latency_distr[i] = 0;
+			spe.prev_cdf[i] = 0;
+		}
+		for(i = 0; i < WINDOW_SIZE; i++)
+			for (j = 0; j < NUM_BINS; j++)
+				spe.cdf_hist[i][j] = 0;
+
+		spe.num_samples = 0;
+		spe.throttle_be_cpus = false;
+		for_each_cpu(i, spe.be_cpu) {
+			struct be_core_info *cinfo = per_cpu_ptr(be_core_info,i);
+			init_irq_work(&cinfo->throttled_context, throttle_thread_soft);
+		}
 		for_each_cpu(i, spe.target_cpu){
 			struct core_info *cinfo = per_cpu_ptr(core_info,i);
 			// Allocate 2 buffers of size BUFFER_SIZE per core
@@ -999,11 +1289,23 @@ static ssize_t sysfs_store_control(struct kobject *kobj,
 			cinfo-> buffer_base = NULL;
 		}
 
-		spe.running = false;
+		WRITE_ONCE(spe.throttle_be_cpus, false);
 
+		for_each_cpu(i, spe.be_cpu){
+			struct be_core_info *cinfo = per_cpu_ptr(be_core_info,i);
+			while(READ_ONCE(cinfo->is_throttled)) {
+				smp_mb();
+				cpu_relax();
+			}
+		}
+
+		spe.running = false;
+		
 		pr_info("sysfs_store_control: SPE stopped\n");
 		pr_debug("sysfs_store_control: Found %d extended packets\n",extended_packets);	
 		pr_debug("First TS seen: %lld, last TS seen: %lld\n", first_ts,last_ts);
+
+		pr_info("Over %lld period, we throttled %lld periods, and stayd the same for %lld periods", total_period, throttled_period, constant_period);
 #if CONFIG_PERF_OPTIMISED < 2
 		pr_info("Average timestamp drift: %lld\n", timestamp_delta/read_records);
 		pr_info("Total records analysed: %lld\n",read_records);
@@ -1020,7 +1322,7 @@ static ssize_t sysfs_store_control(struct kobject *kobj,
 				proc_delay_avg, proc_delay_err);
 		}
 #endif
-		PR_DEBUG("Total number of overflowed samples:%ld\n",overflowed_samples);
+		pr_info("Total number of overflowed samples:%ld\n",overflowed_samples);
 	}
 
 	return count;
@@ -1032,6 +1334,16 @@ static ssize_t sysfs_store_target_cpu(struct kobject *kobj,
 {
 	int ret;
 	if((ret = cpumask_parse(buf, spe.target_cpu)) < 0)
+		return ret;
+	return count;
+}
+
+static ssize_t sysfs_store_be_cpu(struct kobject *kobj,
+				struct kobj_attribute *attr,
+				const char *buf, size_t count)
+{
+	int ret;
+	if((ret = cpumask_parse(buf, spe.be_cpu)) < 0)
 		return ret;
 	return count;
 }
@@ -1445,6 +1757,7 @@ static int __init spe_guard_init(void)
 
 	memset(global, 0, sizeof(struct spe_ctrl));
 	zalloc_cpumask_var(&global->target_cpu, GFP_NOWAIT);
+	zalloc_cpumask_var(&global->be_cpu, GFP_NOWAIT);
 	ts_stats_arr = vmalloc(sizeof(struct ts_stats)*NUM_STATS_RECORDS);
 	if(!ts_stats_arr){
 		// Nothing else was allocated/initialised
@@ -1464,7 +1777,17 @@ static int __init spe_guard_init(void)
 	global->period = g_profiling_period;
 	global->advance = 0;
 
+	global->min_tracked_lat = MIN_TRACKED_LAT;
+	//TODO: better check of input array 
+	//TODO: check highest is 100
+	//TODO: add  min/max bin as parameter
+	if(g_received_bins != NUM_BINS)
+	{
+		ret = -EINVAL;
+		goto free_ts_stats;
+	}
 	core_info = alloc_percpu(struct core_info);
+	be_core_info = alloc_percpu(struct be_core_info);
 
 	cpu_pm_register_notifier(&spe_pm_nb);
 
@@ -1482,6 +1805,10 @@ static int __init spe_guard_init(void)
 		ret = -ENOMEM;
 		goto failed_file_creation;
 	}
+	if(sysfs_create_file(spe_kobj, &be_cpu_attr.attr)<0){
+		ret = -ENOMEM;
+		goto failed_file_creation;
+	}
 	if(sysfs_create_file(spe_kobj, &reader_cpu_attr.attr)<0){
 		ret = -ENOMEM;
 		goto failed_file_creation;
@@ -1494,13 +1821,14 @@ static int __init spe_guard_init(void)
 		ret = -ret;
 		goto failed_file_creation;
 	}
-	
+
 	return 0;  // Return 0 means success
 	//platform_driver_unregister(&spe_bw_driver);
 
 failed_file_creation:
 	sysfs_remove_file(spe_kobj, &control_attr.attr);
 	sysfs_remove_file(spe_kobj, &target_cpu_attr.attr);
+	sysfs_remove_file(spe_kobj, &be_cpu_attr.attr);
 	sysfs_remove_file(spe_kobj, &reader_cpu_attr.attr);
 	
 	kobject_put(spe_kobj);
@@ -1517,9 +1845,11 @@ clean_exit:
 static void __exit spe_guard_exit(void)
 {
 	free_cpumask_var(spe.target_cpu);
+	free_cpumask_var(spe.be_cpu);
 	platform_driver_unregister(&spe_bw_driver);
 	sysfs_remove_file(spe_kobj, &control_attr.attr);
 	sysfs_remove_file(spe_kobj, &target_cpu_attr.attr);
+	sysfs_remove_file(spe_kobj, &be_cpu_attr.attr);
 	sysfs_remove_file(spe_kobj, &reader_cpu_attr.attr);
 	kobject_put(spe_kobj);
 
@@ -1542,6 +1872,13 @@ module_param(g_filt_load, bool, 0444);
 MODULE_PARM_DESC(g_filt_load,"Record load instructions");
 module_param(g_filt_store, bool, 0444);
 MODULE_PARM_DESC(g_filt_store,"Record store instructions");
+module_param(g_regulation_period_us, uint, 0444);
+MODULE_PARM_DESC(g_regulation_period_us,"Time between each regulation");
+module_param_array(g_reference_cdf, ulong, &g_received_bins, 0444);
+MODULE_PARM_DESC(g_reference_cdf, "Array representing reference CDF for FOSD");
+module_param(g_ref_num_samples, uint, 0444);
+MODULE_PARM_DESC(g_ref_num_samples,"Number of samples in CDF");
+
 
 
 MODULE_LICENSE("GPL");

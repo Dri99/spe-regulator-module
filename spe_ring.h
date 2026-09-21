@@ -6,10 +6,19 @@
 #include <linux/spinlock.h>
 #include <linux/types.h>
 
+/*
+ * To activate sliding window regulation, enable CONFIG_DELETE_HISTORY and
+ * CONFIG_SLIDING_WIN. To enable aging window, enable CONFIG_AGING_WIN and 
+ * CONFIG_REG_FULL_HIST.
+ */
 // #define CONFIG_SAMPLE_TS
 // #define CONFIG_SAMPLE_VADDR
-// #define CONFIG_SAMPLE_LAT
-//#define CONFIG_SAMPLE_FULL_RECORD
+#define CONFIG_SAMPLE_LAT
+#define CONFIG_SAMPLE_FULL_RECORD
+// #define CONFIG_REG_FULL_HIST
+#define CONFIG_DELETE_HISTORY
+#define CONFIG_SLIDING_WIN
+// #define CONFIG_AGING_WIN
 
 struct sample {
 #ifdef CONFIG_SAMPLE_TS
@@ -21,10 +30,19 @@ struct sample {
 	u64 vaddr;
 #endif //CONFIG_SAMPLE_VADDR
 #ifdef CONFIG_SAMPLE_LAT
-	u32 issue_lat;
-	u32 total_lat;
-	u32 xlat_lat;
+	u16 issue_lat;
+	u16 total_lat;
+	u16 xlat_lat;
 #endif //CONFIG_SAMPLE_LAT
+#if !defined(CONFIG_SAMPLE_TS) 			\
+	&&  !defined(CONFIG_SAMPLE_VADDR)	\
+	&&  !defined(CONFIG_SAMPLE_LAT)		\
+	&&  !defined(CONFIG_SAMPLE_FULL_RECORD)
+	u8 pad;
+#endif
+};
+
+struct ring_elem {
 #ifdef CONFIG_SAMPLE_FULL_RECORD
 	__uint128_t  record[64 / sizeof(__uint128_t )];
 #endif //CONFIG_SAMPLE_FULL_RECORD
@@ -48,7 +66,7 @@ struct ring_header {
 
 struct ring_shared {
 	struct ring_header hdr;
-	struct sample data[];
+	struct ring_elem data[];
 };
 
 struct spe_ring_dev {
@@ -64,7 +82,7 @@ int spe_ring_dev_register(struct spe_ring_dev **spe_rings_arr,
 			unsigned int ring_entries);
 void spe_ring_dev_deregister(struct spe_ring_dev *spe_rings_arr);
 
-int spe_ring_push_sample(struct spe_ring_dev *ring, struct sample s);
-int spe_ring_push_sample_try(struct spe_ring_dev *ring, struct sample s);
+int spe_ring_push_sample(struct spe_ring_dev *ring, const struct ring_elem *s);
+int spe_ring_push_sample_try(struct spe_ring_dev *ring, const struct ring_elem *s);
 
 #endif //__SPE_RING_H
