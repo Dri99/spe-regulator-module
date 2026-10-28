@@ -235,6 +235,12 @@ struct spe_ctrl {
 	unsigned int samples_in_block, filled_blocks;
 	bool throttle_be_cpus;
 	cpumask_var_t be_cpu;
+
+	/* Variable Binning Structures */
+	unsigned int bin_edges_bit[NUM_BINS];
+
+	/* Reference Integral (Precomputed) */
+	unsigned long long ref_integral[NUM_BINS];
 	bool running;
 };
 
@@ -485,7 +491,7 @@ static void spe_bw_manage_buffer(void *info)
 	
 }
 
-#ifdef CONFIG_SAMPLE_TS_VADDR
+#ifdef CONFIG_SAMPLE_TS
 static inline void fill_sample_cur_ts(struct sample *s)
 {
 	s->timestamp_module = READ_CNTCPT_EL0();
@@ -833,7 +839,7 @@ static inline void request_buffer_maintenance(struct spe_ctrl *s, int cpu)
 
 }
 
-#ifdef CONFIG_TEST_BIN_ASSIGNMENT
+#if defined(CONFIG_TEST_BIN_ASSIGNMENT) && defined(CONFIG_BINARY_SEARCH)
 static bool correct_assignment(int i, unsigned int latency)
 {
 	bool bin_underflow;
@@ -847,8 +853,6 @@ static bool correct_assignment(int i, unsigned int latency)
 		);
 	return (bin_underflow || bin_overflow || normal_bin);
 }
-#else
-static bool correct_assignment(int i) {return true;}
 #endif
 #ifndef CONFIG_VARIABLE_BIN
 static inline int find_bin_index(struct spe_ctrl *s, unsigned int latency)
@@ -996,37 +1000,75 @@ int concat_cdf_value(char * buffer, unsigned long long value)
 	return 0;
 }
 #endif
+
+#ifdef CONFIG_REG_MEAN_ONLY
+#define LIMIT_TO_MEAN (i==0)
+#else
+#define LIMIT_TO_MEAN true
+#endif
 #ifdef CONFIG_REG_FULL_HIST 
+
+#ifdef CONFIG_TAIL_INTEGRATION
+static bool throttle_cdf_comparison_loop(struct spe_ctrl *s,
+				unsigned long long observed_cdf[NUM_BINS])
+{
+	uint64_t acc;
+	int i;
+	for (i = NUM_BINS - 1 -1; i >= 0; i--) {
+		// Reference CDF is scaled to SAMPLES_WINDOW
+		uint64_t term = (observed_cdf[NUM_BINS-1] - observed_cdf[i]) << s->bin_edges_bit[i];
+		acc += term;
+		if(	LIMIT_TO_MEAN &&
+			(acc * g_ref_num_samples 
+			> s->ref_integral[i] * observed_cdf[NUM_BINS-1])) {
+			PR_TRACE("Tail integration violate %lld/%lld > %lld at %d", 
+					acc,observed_cdf[NUM_BINS-1],s->ref_integral[i], g_bin_edges[i]
+					);
+			return true;
+		}
+	}
+	return false;
+}
+#elif defined(CONFIG_FOSD)
+static bool throttle_cdf_comparison_loop(struct spe_ctrl *s,
+				unsigned long long observed_cdf[NUM_BINS])
+{
+	unsigned int i;
+	for(i = 0; i < NUM_BINS ; i++) {
+		//Should divide each CDF by num of samples, but instead we multiply by the other's divisor
+		if(observed_cdf[i] * g_ref_num_samples < 
+			g_reference_cdf[i] * s->num_samples) {
+			PR_TRACE("FOSD violate %lld over %d < %ld over %d at %d", 
+					observed_cdf[i],s->num_samples,
+					g_reference_cdf[i],g_ref_num_samples,
+					i*BIN_WIDTH + MIN_TRACKED_LAT
+					);
+			return true;
+		}
+	}
+	return false;
+}
+#endif
+
+
 static void evaluate_regulation(struct spe_ctrl *s)
 {
 	unsigned long long observed_cdf[NUM_BINS];
-	unsigned int i;
+	int i;
 	bool throttle_cores = false;
 	char *local_buf = str_buf;
 
 	total_period++;
 	observed_cdf[0] = s->latency_distr[0];
+	PR_TRACE("CDF now:");
 	for(i = 1; i < NUM_BINS ; i++){
 		observed_cdf[i] = observed_cdf[i-1] + s->latency_distr[i];
 		local_buf += concat_cdf_value(local_buf, observed_cdf[i]);
 	}
 	PR_TRACE("CDF now: %s",str_buf);
 
-	//Check FOSD
-	for(i = 0; i < NUM_BINS ; i++) {
-		//Should divide each CDF by num of samples, but instead we multiply by the other's divisor
-		if(observed_cdf[i] * g_ref_num_samples < 
-			g_reference_cdf[i] * s->num_samples) {
-			throttle_cores = true;
-			PR_TRACE("FOSD violate %lld over %d < %ld over %d at %d", 
-					observed_cdf[i],s->num_samples,
-					g_reference_cdf[i],g_ref_num_samples,
-					i*BIN_WIDTH + MIN_TRACKED_LAT
-					);
-			break;
-		}
-	}
-	
+	throttle_cores = throttle_cdf_comparison_loop(s, observed_cdf);
+
 	if (throttle_cores && READ_ONCE(s->throttle_be_cpus)) {
 		// Do nothing, keep waiting
 		constant_period++;
@@ -1053,10 +1095,54 @@ static void evaluate_regulation(struct spe_ctrl *s)
 #endif 
 
 #ifdef CONFIG_SLIDING_WIN
-static void evaluate_regulation(struct spe_ctrl *s)
+#ifdef CONFIG_TAIL_INTEGRATION
+static bool throttle_cdf_comparison_loop(struct spe_ctrl *s)
+{
+	uint64_t acc;
+	int i;
+	for (i = NUM_BINS - 1 -1; i >= 0; i--) {
+		// Reference CDF is scaled to SAMPLES_WINDOW
+		uint64_t term = (SAMPLES_WINDOW - s->prev_cdf[i]) << s->bin_edges_bit[i];
+		acc += term;
+		if(LIMIT_TO_MEAN &&
+			(	acc * g_reference_cdf[i]
+				> s->ref_integral[i]*s->prev_cdf[i])
+		) {
+			PR_TRACE("Tail integration violate %lld > %lld at %d", 
+					acc,s->ref_integral[i], g_bin_edges[i]
+					);
+			return true;
+		}
+	}
+	return false;
+}
+#elif defined(CONFIG_FOSD)
+static bool throttle_cdf_comparison_loop(struct spe_ctrl *s)
 {
 	unsigned int i;
-	unsigned int num_samples;
+	unsigned int num_samples = s->prev_cdf[NUM_BINS-1];
+	for(i = 0; i < NUM_BINS ; i++) {
+		/*
+		 * Should divide each CDF by num of samples, but instead we 
+		 * multiply by the other's divisor
+		 */
+		if(s->prev_cdf[i] * g_ref_num_samples <
+			g_reference_cdf[i] * num_samples) {
+			PR_TRACE("FOSD violate %lld over %d < %ld over %d at %d", 
+					s->prev_cdf[i],s->num_samples,
+					g_reference_cdf[i],g_ref_num_samples,
+					i*BIN_WIDTH + MIN_TRACKED_LAT
+					);
+			return true;
+		}
+	}
+	return false;
+}
+#endif
+
+static void evaluate_regulation(struct spe_ctrl *s)
+{
+	int i;
 	bool throttle_cores = false;
 	char *local_buf = str_buf;
 
@@ -1073,27 +1159,15 @@ static void evaluate_regulation(struct spe_ctrl *s)
 		s->prev_cdf[i] += s->cdf_hist[s->it_win][i];
 		local_buf += concat_cdf_value(local_buf, s->prev_cdf[i]);
 	}
-	PR_TRACE("CDF now: %s",str_buf);
 
-	num_samples = s->prev_cdf[NUM_BINS-1];
-	//Check FOSD
-	for(i = 0; i < NUM_BINS ; i++) {
-		/*
-		 * Should divide each CDF by num of samples, but instead we 
-		 * multiply by the other's divisor
-		 */
-		if(s->prev_cdf[i] * g_ref_num_samples < 
-			g_reference_cdf[i] * num_samples) {
-			throttle_cores = true;
-			PR_TRACE("FOSD violate %lld over %d < %ld over %d at %d", 
-					s->prev_cdf[i],s->num_samples,
-					g_reference_cdf[i],g_ref_num_samples,
-					i*BIN_WIDTH + MIN_TRACKED_LAT
-					);
-			break;
-		}
+	if(s->cdf_hist[s->it_win][NUM_BINS-1] != SAMPLES_BLOCK) {
+		pr_warn("Partial CDF with wrong total number of samples: %lld != %d at %d",
+		s->cdf_hist[s->it_win][NUM_BINS-1], SAMPLES_BLOCK, s->it_win
+		);
 	}
-	
+
+	throttle_cores = throttle_cdf_comparison_loop(s);
+
 	if (throttle_cores && READ_ONCE(s->throttle_be_cpus)) {
 		// Do nothing, keep waiting
 		constant_period++;
@@ -1285,7 +1359,7 @@ static ssize_t sysfs_store_control(struct kobject *kobj,
 {	
 	// Resetting extended packets counter;
 	bool alloc_failed = false;
-	unsigned int i;
+	int i;
 	extended_packets = 0;
 	if (sysfs_streq(buf, "start")) {
 		if (spe.running)
@@ -1733,6 +1807,96 @@ static void enable_el0_cntpct(void *data){
 	write_sysreg_s(reg, SYS_CNTKCTL_EL1); 
 }
 
+#if defined(CONFIG_VARIABLE_BIN) && defined(CONFIG_TAIL_INTEGRATION)
+static unsigned int table_log2(unsigned int x)
+{
+	if (x > 1024)
+		return 128;
+
+	switch(x) {
+	case 1:
+		return 0;
+	case 2:
+		return 1;
+	case 4:
+		return 2;
+	case 8:
+		return 3;
+	case 16:
+		return 4;
+	case 32:
+		return 5;
+	case 64:
+		return 6;
+	case 128:
+		return 7;
+	case 256:
+		return 8;
+	case 512:
+		return 9;
+	case 1024:
+		return 10;
+	default:
+		return 128;
+	}
+}
+
+static bool validate_g_bin_edge(void)
+{
+	int i;
+	// Check all but last bin
+	for (i = 0; i < NUM_BINS - 1; i++) {
+		unsigned int width = g_bin_edges[i+1] - g_bin_edges[i];
+		// Check if width is power of 2
+		if (width == 0 || (width & (width - 1)) != 0) {
+			pr_err("Bin width %u between edges %u and %u is not power of 2\n", 
+				width, g_bin_edges[i], g_bin_edges[i+1]);
+			return false;
+		}
+		spe.bin_edges_bit[i] = table_log2(width);
+	}
+	return true;
+}
+#else
+static bool validate_g_bin_edge(void) {return true;}
+#endif
+
+/*
+ * Check if g_bin_edges is set, otherwise set known good values, and validate 
+ * for integration
+ */
+static bool g_bin_edge_init(void)
+{
+	int i;
+	bool bin_arr_set = false;
+
+	for (i = 0; i < NUM_BINS ; i++) {
+		if(g_bin_edges[i] != 0)
+			bin_arr_set = true;
+	}
+	if(bin_arr_set == false) {
+		for (i = 0; i < NUM_BINS ; i++)
+			g_bin_edges[i] = i+3;
+	}
+
+	return validate_g_bin_edge();
+}
+
+/* Precompute Reference Integral */
+// Integrate (1 - CDF) * Width from max latency to 0
+static void precompute_ref_integral(struct spe_ctrl* s)
+{
+	int i;
+	uint32_t acc = 0;
+	for (i = NUM_BINS - 1 - 1; i >= 0; i--) {
+		// Reference CDF is scaled to SAMPLES_WINDOW
+		uint32_t term = (g_reference_cdf[NUM_BINS-1] - g_reference_cdf[i]) 
+				<< s->bin_edges_bit[i];
+		acc += term;
+		s->ref_integral[i] = acc;
+	}
+}
+
 // Initialization function (called when the module is loaded)
 static int __init spe_guard_init(void)
 {
@@ -1745,8 +1909,6 @@ static int __init spe_guard_init(void)
 	int counter_sz;
 	int ret;
 	u16 pmsver;
-	bool bin_arr_set = false;
-	int i;
 
 	fld = cpuid_feature_extract_unsigned_field(read_cpuid(ID_AA64DFR0_EL1),
 						ID_AA64DFR0_PMSVER_SHIFT);
@@ -1868,16 +2030,11 @@ static int __init spe_guard_init(void)
 				enable_el0_cntpct,
 				NULL, 1);
 	}
-	//Check if g_bin_edges is set
-	for (i = 0; i < NUM_BINS ; i++) {
-		if(g_bin_edges[i] != 0)
-			bin_arr_set = true;
-	}
-	if(bin_arr_set == false) {
-		for (i = 0; i < NUM_BINS ; i++)
-			g_bin_edges[i] = i+3;
+	if(g_bin_edge_init() == false) {
+		return -EINVAL;
 	}
 
+	precompute_ref_integral(&spe);
 	memset(global, 0, sizeof(struct spe_ctrl));
 	zalloc_cpumask_var(&global->target_cpu, GFP_NOWAIT);
 	zalloc_cpumask_var(&global->be_cpu, GFP_NOWAIT);
