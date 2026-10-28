@@ -180,14 +180,21 @@ struct be_core_info {
 	struct irq_work throttled_context;
 };
 
-#define NUM_BINS 100
+#define NUM_BINS 256
 #define MAX_TRACKED_LAT 2015
-#define MIN_TRACKED_LAT 15
+#define MIN_TRACKED_LAT 0
 #define BIN_WIDTH (unsigned int)((MAX_TRACKED_LAT - MIN_TRACKED_LAT) / NUM_BINS)
-#define WINDOW_SIZE 1000
+
 #define AGE_FACT_NUM 255
 #define AGE_FACT_DEN 256
 #define DECIMAL_BITS  12
+// Tunable power of 2 (e.g., 16384 samples)
+#define SAMPLES_WINDOW		(1 << 11)
+// Tunable block size (e.g., 256 samples)
+#define SAMPLES_BLOCK		(1 << 10)
+#define NUM_BLOCKS_IN_WINDOW 	(SAMPLES_WINDOW / SAMPLES_BLOCK)
+#define WINDOW_SIZE NUM_BLOCKS_IN_WINDOW
+
 struct spe_ctrl {
 	size_t size;
 	//interrupts = <0x01 0x05 0x04>;
@@ -214,7 +221,7 @@ struct spe_ctrl {
 	unsigned int min_tracked_lat;
 	unsigned long long latency_distr[NUM_BINS];
 	unsigned long long prev_cdf[NUM_BINS];
-	unsigned long long cdf_hist[WINDOW_SIZE][NUM_BINS];
+	unsigned long long cdf_hist[NUM_BLOCKS_IN_WINDOW][NUM_BINS];
 	unsigned int it_win;
 	unsigned int num_samples;
 	//Reference distibution is recorded over a power of 2 number of samples
@@ -1073,7 +1080,7 @@ static bool try_read_record(struct spe_ctrl *s,
 	if (cinfo->primary.buf < limit &&
 		next_to_read != ones_mask)
 	{
-		PR_DEBUG("SPE record at %llx\n",(u64) cinfo->primary.buf);
+		PR_TRACE("SPE record at %llx\n",(u64) cinfo->primary.buf);
 
 		ts_before_process = get_exact_cntpct();
 
@@ -1095,7 +1102,7 @@ static bool try_read_record(struct spe_ctrl *s,
 
 		//With the equal comparison, it will only trigger once
 		if (cinfo->primary.buf == cinfo->primary.watermark ) {
-			PR_DEBUG("spe_reader():watermark hit\n");
+			PR_TRACE("spe_reader():watermark hit\n");
 			request_buffer_maintenance(s,cpu);
 		}
 	}
@@ -1150,7 +1157,7 @@ static void compute_stats(unsigned long long *read_delay_avg,
 	for(i=0; i<effective_saved_stats; i++){
 		*read_delay_avg += ts_stats_arr[i].spe_reader_delay;
 		*proc_delay_avg += ts_stats_arr[i].reader_process_delay;
-		PR_DEBUG("%d\n",ts_stats_arr[i].spe_reader_delay);
+		PR_TRACE("%d\n",ts_stats_arr[i].spe_reader_delay);
 	}
 	*read_delay_avg = *read_delay_avg / effective_saved_stats;
 	*proc_delay_avg = *proc_delay_avg / effective_saved_stats;
@@ -1162,15 +1169,15 @@ static void compute_stats(unsigned long long *read_delay_avg,
 	*read_delay_err = *read_delay_err / effective_saved_stats;
 	*proc_delay_err = *proc_delay_err / effective_saved_stats;
 }
-#endif 
+#endif
 
 static ssize_t sysfs_store_control(struct kobject *kobj,
-			     struct kobj_attribute *attr,
-			     const char *buf, size_t count)
+				struct kobj_attribute *attr,
+				const char *buf, size_t count)
 {	
 	// Resetting extended packets counter;
 	bool alloc_failed = false;
-	unsigned int i,j;
+	unsigned int i;
 	extended_packets = 0;
 	if (sysfs_streq(buf, "start")) {
 		if (spe.running)
@@ -1187,13 +1194,9 @@ static ssize_t sysfs_store_control(struct kobject *kobj,
 
 		spe.it_win = 0;
 		spe.size = BUFFER_SIZE;
-		for(i = 0; i < NUM_BINS; i++) {
-			spe.latency_distr[i] = 0;
-			spe.prev_cdf[i] = 0;
-		}
-		for(i = 0; i < WINDOW_SIZE; i++)
-			for (j = 0; j < NUM_BINS; j++)
-				spe.cdf_hist[i][j] = 0;
+		memset(spe.latency_distr, 0, NUM_BINS*sizeof(*spe.latency_distr));
+		memset(spe.prev_cdf, 0, NUM_BINS*sizeof(*spe.prev_cdf));
+		memset(spe.cdf_hist,0,WINDOW_SIZE*NUM_BINS*sizeof(**spe.cdf_hist));
 
 		spe.num_samples = 0;
 		spe.throttle_be_cpus = false;
@@ -1216,7 +1219,7 @@ static ssize_t sysfs_store_control(struct kobject *kobj,
 				.watermark = cinfo->buffer_base + 
 					(
 						spe.size
-						*WATERMARK_DEN
+						*WATERMARK_NUM
 						/WATERMARK_DEN
 					),
 				.ready = 0
@@ -1228,7 +1231,7 @@ static ssize_t sysfs_store_control(struct kobject *kobj,
 					+ spe.size
 					+(
 						spe.size
-						*WATERMARK_DEN
+						*WATERMARK_NUM
 						/WATERMARK_DEN
 					),
 				.ready = 0
@@ -1498,22 +1501,22 @@ static irqreturn_t spe_bw_irq_handler(int irq, void *dev)
 }
 
 static int spe_pm_callback(struct notifier_block *nb,
-                           unsigned long action,
-                           void *data)
-{
-    switch (action) {
+				unsigned long action,
+				void *data)
+	{
+	switch (action) {
 
-    case CPU_PM_ENTER:
-        PR_DEBUG("CPU %d going sleep.\n", smp_processor_id());
-        break;
+	case CPU_PM_ENTER:
+		PR_TRACE("CPU %d going sleep.\n", smp_processor_id());
+	break;
 
-    case CPU_PM_EXIT:
-        /* CPU resumed from low power state */
-        PR_DEBUG("CPU %d waking up.\n", smp_processor_id());
-        break;
-    }
+	case CPU_PM_EXIT:
+	/* CPU resumed from low power state */
+		PR_TRACE("CPU %d waking up.\n", smp_processor_id());
+	break;
+	}
 
-    return NOTIFY_OK;
+	return NOTIFY_OK;
 }
 
 static int spe_bw_device_probe(struct platform_device *pdev)
