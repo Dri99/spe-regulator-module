@@ -273,8 +273,10 @@ static bool g_record_kernel = true;
 static bool g_filt_load = false;
 static bool g_filt_store = false;
 static unsigned int g_regulation_period_us = 1000;
-static unsigned long g_reference_cdf[NUM_BINS];
-static unsigned int g_received_bins = 100;
+static unsigned long g_reference_cdf[NUM_BINS] = {0};
+static unsigned int g_bin_edges[NUM_BINS];
+static unsigned int g_ref_cdf_len = NUM_BINS;
+static unsigned int g_var_bin_len = NUM_BINS;
 static unsigned int g_ref_num_samples = 1024;
 static unsigned long long throttled_period, total_period, constant_period;
 //struct kobj_attribute etx_attr = __ATTR(etx_value, 0660, sysfs_show, sysfs_store);
@@ -825,7 +827,68 @@ static inline void request_buffer_maintenance(struct spe_ctrl *s, int cpu)
 		pr_warn("error in calling spe_bw_manage_buffer");
 
 }
- 
+
+#ifdef CONFIG_TEST_BIN_ASSIGNMENT
+static bool correct_assignment(int i, unsigned int latency)
+{
+	bool bin_underflow;
+	bool bin_overflow;
+	bool normal_bin;
+	bin_underflow = (i==0 && latency <= g_bin_edges[0]);
+	bin_overflow = (i==NUM_BINS-1 && latency >= g_bin_edges[NUM_BINS-1-1]);
+	normal_bin = (
+			(0<i && i<NUM_BINS-1) 
+			&& (g_bin_edges[i-1] < latency && latency <= g_bin_edges[i])
+		);
+	return (bin_underflow || bin_overflow || normal_bin);
+}
+#else
+static bool correct_assignment(int i) {return true;}
+#endif
+#ifndef CONFIG_VARIABLE_BIN
+static inline int find_bin_index(struct spe_ctrl *s, unsigned int latency)
+{
+	unsigned int idx_bin;
+	if (latency == s->min_tracked_lat )
+		idx_bin = 0;
+	else
+		idx_bin = (latency - s->min_tracked_lat - 1) / BIN_WIDTH + 1;
+	return idx_bin;
+}
+#elif defined(CONFIG_BINARY_SEARCH)
+// Binary search for the first edge > latency
+static inline int find_bin_index(struct spe_ctrl *s, unsigned int latency)
+{
+	int low = 0;
+	int high = NUM_BINS - 1; // We have NUM_BINS edges
+	int i;
+	while (low < high) {
+		int mid = (low + high) >> 1;
+		if (g_bin_edges[mid] < latency) {
+			low = mid + 1;
+		} else {
+			high = mid;
+		}
+	}
+	// low is now the index of the bin: g_bin_edges[low-1] <= latency < g_bin_edges[low]
+	i = (low <= NUM_BINS-1) ? low : NUM_BINS-1;
+	if(!correct_assignment(i,latency)) {
+		pr_warn("Wrong assignment: %d in %d", latency, g_bin_edges[i]);
+	}
+	return i;
+}
+#else //CONFIG_BINARY_SEARCH
+static inline int find_bin_index(struct spe_ctrl *s, unsigned int latency)
+{
+	int i;
+	for(i=0; i<NUM_BINS;i++){
+		if(latency < g_bin_edges[i]) {
+			break;
+		}
+	}
+	return i-1;
+}
+#endif //CONFIG_BINARY_SEARCH
 
 static void bin_sample(struct spe_ctrl *s, struct sample *sample)
 {
@@ -839,11 +902,7 @@ static void bin_sample(struct spe_ctrl *s, struct sample *sample)
 
 	if( exec_lat < s->min_tracked_lat)
 		return;
-	// Value equal to bin counts in bin, value higher counts in next 
-	if (exec_lat == s->min_tracked_lat )
-		idx_bin = 0;
-	else
-		idx_bin = (exec_lat - s->min_tracked_lat - 1) / BIN_WIDTH + 1;
+	idx_bin = find_bin_index(s, exec_lat);
 #ifdef CONFIG_AGING_WIN
 	if(idx_bin < NUM_BINS)
 		s->latency_distr[idx_bin] += (1 << DECIMAL_BITS);
@@ -1636,6 +1695,8 @@ static int __init spe_guard_init(void)
 	int counter_sz;
 	int ret;
 	u16 pmsver;
+	bool bin_arr_set = false;
+	int i;
 
 	fld = cpuid_feature_extract_unsigned_field(read_cpuid(ID_AA64DFR0_EL1),
 						ID_AA64DFR0_PMSVER_SHIFT);
@@ -1757,6 +1818,15 @@ static int __init spe_guard_init(void)
 				enable_el0_cntpct,
 				NULL, 1);
 	}
+	//Check if g_bin_edges is set
+	for (i = 0; i < NUM_BINS ; i++) {
+		if(g_bin_edges[i] != 0)
+			bin_arr_set = true;
+	}
+	if(bin_arr_set == false) {
+		for (i = 0; i < NUM_BINS ; i++)
+			g_bin_edges[i] = i+3;
+	}
 
 	memset(global, 0, sizeof(struct spe_ctrl));
 	zalloc_cpumask_var(&global->target_cpu, GFP_NOWAIT);
@@ -1784,8 +1854,10 @@ static int __init spe_guard_init(void)
 	//TODO: better check of input array 
 	//TODO: check highest is 100
 	//TODO: add  min/max bin as parameter
-	if(g_received_bins != NUM_BINS)
+	if(g_ref_cdf_len != NUM_BINS || g_var_bin_len != NUM_BINS)
 	{
+		pr_warn("g_ref_cdf_len = %d, g_var_bin_len = %d",
+			g_ref_cdf_len,g_var_bin_len);
 		ret = -EINVAL;
 		goto free_ts_stats;
 	}
@@ -1877,10 +1949,12 @@ module_param(g_filt_store, bool, 0444);
 MODULE_PARM_DESC(g_filt_store,"Record store instructions");
 module_param(g_regulation_period_us, uint, 0444);
 MODULE_PARM_DESC(g_regulation_period_us,"Time between each regulation");
-module_param_array(g_reference_cdf, ulong, &g_received_bins, 0444);
+module_param_array(g_reference_cdf, ulong, &g_ref_cdf_len, 0444);
 MODULE_PARM_DESC(g_reference_cdf, "Array representing reference CDF for FOSD");
 module_param(g_ref_num_samples, uint, 0444);
 MODULE_PARM_DESC(g_ref_num_samples,"Number of samples in CDF");
+module_param_array(g_bin_edges, uint, &g_var_bin_len, 0444);
+MODULE_PARM_DESC(g_bin_edges, "Array representing bins for the reference CDF");
 
 
 
