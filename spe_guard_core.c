@@ -178,6 +178,7 @@ struct core_info{
 struct be_core_info {
 	bool is_throttled;
 	struct irq_work throttled_context;
+	struct spe_ctrl *s;
 };
 
 #define NUM_BINS 256
@@ -194,6 +195,8 @@ struct be_core_info {
 #define SAMPLES_BLOCK		(1 << 10)
 #define NUM_BLOCKS_IN_WINDOW 	(SAMPLES_WINDOW / SAMPLES_BLOCK)
 #define WINDOW_SIZE NUM_BLOCKS_IN_WINDOW
+
+#define MIN_THROTTLE_US 10U
 
 struct spe_ctrl {
 	size_t size;
@@ -931,19 +934,31 @@ static void bin_sample(struct spe_ctrl *s, struct sample *sample)
 
 static void throttle_thread(void* info)
 {
-	struct spe_ctrl *s = info;
 	struct be_core_info *cinfo = this_cpu_ptr(be_core_info);
+	BUG_ON(!cinfo);
+	irq_work_queue(&cinfo->throttled_context);
 	WRITE_ONCE(cinfo->is_throttled, true);
-	while(READ_ONCE(s->throttle_be_cpus)) {
-		smp_mb();
-		cpu_relax();
-	}
-	WRITE_ONCE(cinfo->is_throttled, false);
-	//TODO: should switch to softirq, but we already have reader_cpu stuck in hard irq
+	PR_TRACE("Throttling cpu %d...",smp_processor_id());
 }
 
 static void throttle_thread_soft(struct irq_work *entry) {
 	//TODO: To be done
+	u64 end;
+	struct be_core_info *cinfo = this_cpu_ptr(be_core_info);
+	//TODO: I need a mechanism to ensure this irq_work is run on the core that asked the irq_work_queue
+	end = ktime_get_boottime_ns() + NSEC_PER_USEC * MIN_THROTTLE_US;
+	//Forced wait for 10 us
+	while(end > ktime_get_boottime_ns()) {
+		smp_mb();
+		cpu_relax();
+	}
+	if(READ_ONCE(cinfo->s->throttle_be_cpus))
+		irq_work_queue(&cinfo->throttled_context);
+	else {
+		PR_TRACE("Cpu %d out of throttle",smp_processor_id());
+		WRITE_ONCE(cinfo->is_throttled, false);
+	}
+	//TODO: should switch to softirq, but we already have reader_cpu stuck in hard irq
 }
 
 #ifdef CONFIG_AGING_WIN
@@ -1296,6 +1311,7 @@ static ssize_t sysfs_store_control(struct kobject *kobj,
 		for_each_cpu(i, spe.be_cpu) {
 			struct be_core_info *cinfo = per_cpu_ptr(be_core_info,i);
 			init_irq_work(&cinfo->throttled_context, throttle_thread_soft);
+			cinfo->s = &spe;
 		}
 		for_each_cpu(i, spe.target_cpu){
 			struct core_info *cinfo = per_cpu_ptr(core_info,i);
