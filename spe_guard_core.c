@@ -228,6 +228,8 @@ struct spe_ctrl {
 	unsigned int reference_distr[NUM_BINS];
 	//TODO: optimize g_ref_num_samples by changing it to power of 2
 	u64 next_regulation_ns;
+	//For sampe based regulation
+	unsigned int samples_in_block, filled_blocks;
 	bool throttle_be_cpus;
 	cpumask_var_t be_cpu;
 	bool running;
@@ -890,6 +892,8 @@ static inline int find_bin_index(struct spe_ctrl *s, unsigned int latency)
 }
 #endif //CONFIG_BINARY_SEARCH
 
+static void period_count_sample(struct spe_ctrl *s);
+
 static void bin_sample(struct spe_ctrl *s, struct sample *sample)
 {
 	unsigned int exec_lat;
@@ -918,7 +922,7 @@ static void bin_sample(struct spe_ctrl *s, struct sample *sample)
 
 	s->num_samples++;
 #endif
-	
+	period_count_sample(s);
 	//TODO: what to do with overflowing ones?
 	//TODO: better with manual bins
 	//TODO: evalaute manual bins to have least difference between square and
@@ -1100,6 +1104,7 @@ static void evaluate_regulation(struct spe_ctrl *s)
 }
 #endif
 
+#ifdef CONFIG_TIME_BASED_REGULATION
 static bool should_regulate(struct spe_ctrl *s)
 {
 	return (ktime_get_boottime_ns() >= s->next_regulation_ns);
@@ -1118,6 +1123,35 @@ static void set_next_period(struct spe_ctrl *s)
 {
 	s->next_regulation_ns += NSEC_PER_USEC * g_regulation_period_us;
 }
+
+static void period_count_sample(struct spe_ctrl *s) {}
+
+#elif defined(CONFIG_SAMPLE_BASED_REGULATION)
+static bool should_regulate(struct spe_ctrl *s)
+{
+	return (/*s->filled_blocks >= WINDOW_SIZE &&*/
+		s->samples_in_block == SAMPLES_BLOCK);
+}
+
+static void init_next_period(struct spe_ctrl *s)
+{
+
+	s->samples_in_block = 0;
+	s->filled_blocks = 0;
+}
+
+static void set_next_period(struct spe_ctrl *s)
+{
+	s->samples_in_block = 0;
+	if(s->filled_blocks < WINDOW_SIZE)
+		s->filled_blocks++;
+}
+
+static void period_count_sample(struct spe_ctrl *s)
+{
+	s->samples_in_block++;
+}
+#endif
 
 static bool try_read_record(struct spe_ctrl *s,
 				unsigned int cpu)
