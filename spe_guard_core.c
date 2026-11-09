@@ -313,6 +313,9 @@ static ssize_t sysfs_store_be_cpu(struct kobject *kobj,
 static ssize_t sysfs_store_reader_cpu(struct kobject *kobj,
 			     struct kobj_attribute *attr,
 			     const char *buf, size_t count);
+static ssize_t sysfs_show_text_section (struct kobject *kobj,
+				struct kobj_attribute *attr,
+				char *buf);
 
 static struct kobj_attribute control_attr = __ATTR(control, 0664, NULL,
 							sysfs_store_control);
@@ -322,6 +325,9 @@ static struct kobj_attribute be_cpu_attr = __ATTR(be_cpu, 0664, NULL,
 							sysfs_store_be_cpu);
 static struct kobj_attribute reader_cpu_attr =  __ATTR(reader_cpu, 0664, NULL,
 							sysfs_store_reader_cpu);
+static struct kobj_attribute text_section_attr =  __ATTR(text_section, 0664,
+							sysfs_show_text_section,
+							NULL);
 
 
 /**************************************************************************
@@ -1686,6 +1692,16 @@ static ssize_t sysfs_store_reader_cpu(struct kobject *kobj,
     return count;
 }
 
+static ssize_t sysfs_show_text_section (struct kobject *kobj,
+				struct kobj_attribute *attr,
+				char *buf)
+{
+	u64 module_text_start, module_text_end;
+	module_text_start = (unsigned long)THIS_MODULE->core_layout.base;
+	module_text_end = module_text_start + THIS_MODULE->core_layout.text_size;
+	return sysfs_emit(buf, "0x%llx\n0x%llx\n", module_text_start, module_text_end);
+}
+
 static int spe_bw_init_debugfs(void){
 	//TODO: to add some files here
 	return 0;
@@ -2238,6 +2254,10 @@ static int __init spe_guard_init(void)
 		ret = -ENOMEM;
 		goto failed_file_creation;
 	}
+	if(sysfs_create_file(spe_kobj, &text_section_attr.attr)<0){
+		ret = -ENOMEM;
+		goto failed_file_creation;
+	}
 
 	spe_bw_init_debugfs();
 	
@@ -2255,6 +2275,7 @@ failed_file_creation:
 	sysfs_remove_file(spe_kobj, &target_cpu_attr.attr);
 	sysfs_remove_file(spe_kobj, &be_cpu_attr.attr);
 	sysfs_remove_file(spe_kobj, &reader_cpu_attr.attr);
+	sysfs_remove_file(spe_kobj, &text_section_attr.attr);
 	
 	kobject_put(spe_kobj);
 	
@@ -2276,6 +2297,7 @@ static void __exit spe_guard_exit(void)
 	sysfs_remove_file(spe_kobj, &target_cpu_attr.attr);
 	sysfs_remove_file(spe_kobj, &be_cpu_attr.attr);
 	sysfs_remove_file(spe_kobj, &reader_cpu_attr.attr);
+	sysfs_remove_file(spe_kobj, &text_section_attr.attr);
 	kobject_put(spe_kobj);
 
 	cpu_pm_unregister_notifier(&spe_pm_nb);
