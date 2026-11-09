@@ -33,6 +33,7 @@
 #include <linux/slab.h>
 #include <linux/smp.h>
 #include <asm/unaligned.h>
+#include <linux/version.h>
 #include <linux/vmalloc.h>
 
 #include <asm/barrier.h>
@@ -47,8 +48,9 @@
 
 #define BUFFER_SIZE (1 << 21)
 #define SPE_BW_PERIOD 512
-#define WATERMARK_NUM 1
-#define WATERMARK_DEN 2
+#define SPE_HW_SAMPLE_SIZE 64UL
+#define WATERMARK_NUM 8
+#define WATERMARK_DEN 16
 #define CONFIG_PERF_OPTIMISED 2
 #define PKT_PAYLOAD_SZ_MASK (0x3)
 #define PKT_PAYLOAD_SZ_SHIFT (4)
@@ -56,8 +58,9 @@
 #define ID_AA64DFR2_EL1		sys_reg(3, 0, 0, 5, 2)
 
 #define BIT_GET(_fld, _reg) (_reg & BIT(_fld ## _SHIFT))
-#define BIT_SET(_fld) (_reg & BIT(_fld ## _SHIFT))
-#define FIELD_GET_LOCAL(_fld, _reg) (_reg >> _fld ## _SHIFT & _fld ## _MASK)
+#define BIT_SET(_fld, _reg) (_reg | BIT(_fld ## _SHIFT))
+#define BIT_CLEAR(_fld, _reg) (_reg & (~BIT(_fld ## _SHIFT)))
+#define FIELD_GET_LOCAL(_fld, _reg) ((_reg >> _fld ## _SHIFT) & _fld ## _MASK)
 #define FIELD_SET_LOCAL(_fld, _reg) ((_reg & _fld ## _MASK) << _fld ## _SHIFT )
 //assert(typeof(var1)==typeof(var2))
 #define SWAP(var1, var2) 	\
@@ -167,6 +170,11 @@ struct core_info{
 	struct spe_buffer primary;
 	struct spe_buffer secondary;
 	unsigned int active_buffer;
+	struct perf_event *buffer_full_event;
+	struct irq_work	buffer_full_pending; /* delayed work for NMIs */
+	u64 old_buffer_val;
+	
+	struct spe_ctrl *s;
 	void *buffer_base;
 	/*
 	 * TODO: [IDEA] pass only core_info and have it pointing to 
@@ -418,24 +426,83 @@ static inline u16 spe_bw_get_record_counter(void *payload_addr){
 	return counter;
 }
 
+/**
+ * budget is used up. PMU generate an interrupt
+ * this run in hardirq, nmi context with irq disabled
+ */
+static void event_overflow_callback(struct perf_event *event,
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 2, 0)
+					int nmi,
+#endif
+					struct perf_sample_data *data,
+					struct pt_regs *regs)
+{
+	struct core_info *cinfo = this_cpu_ptr(core_info);
+	BUG_ON(!cinfo);
+	irq_work_queue(&cinfo->buffer_full_pending);
+}
+
+static inline int process_record(void *base, struct sample *s);
+
 /*
  * Run in interrupt, stops SPE on a buffer, and restarts it on the secondary.
  * It sets primary limit to the point where SPE HW effectively wrote
  * When spe_reader gets to new limit, performs buffer swap
 */
-static void spe_bw_manage_buffer(void *info)
+//Don't know where to place this
+static void __start_counter(void *info){}
+static void __stop_counter(void *info){}
+//local64_set(&cinfo->buffer_full_event->hw.period_left, spe_ctrl->size/SPE_HW_SAMPLE_SIZE);
+
+/** read current counter value. */
+static inline u64 perf_event_count(struct perf_event *event)
+{
+	return local64_read(&event->count) + 
+		atomic64_read(&event->child_count);
+}
+/** return used event in the current period */
+static inline u64 spe_guard_buffer_full_event_used(struct core_info *cinfo)
+{
+	return perf_event_count(cinfo->buffer_full_event) - cinfo->old_buffer_val;
+}
+
+static void spe_bw_manage_buffer(struct irq_work *entry)
 {
 	unsigned int cpu = smp_processor_id();
-	struct spe_ctrl *spe_ctrl = (struct spe_ctrl*) info;
+	struct spe_ctrl *spe_ctrl;
 	struct core_info *cinfo = this_cpu_ptr(core_info);
 	void* secondary_buf,*secondary_limit;
 	u64 reg;
+	u64 buffer_full_new;
+	struct sample s;
+	bool overrun = false;
+
+	spe_ctrl = cinfo->s;
+	BUG_ON(!spe_ctrl);
 
 	spe_bw_management_called[cpu]++;
 	pr_debug("Management function triggered on cpu %d", cpu);
 	spe_bw_disable_and_drain_local();
+
+	cinfo->buffer_full_event->pmu->stop(cinfo->buffer_full_event, PERF_EF_UPDATE);
 	reg = read_sysreg_s(SYS_PMBPTR_EL1);
-	
+	pr_debug_ratelimited(
+		"spe_bw_manage_buffer: samples by SYS_PMBPTR_EL1:%lld by PMU: %lld\n",
+		(
+			reg
+			-
+			(
+				(u64)cinfo->buffer_base
+				+ cinfo->active_buffer
+				* spe_ctrl->size
+			)
+		)
+		/SPE_HW_SAMPLE_SIZE,
+		spe_guard_buffer_full_event_used(cinfo)
+	);
+	buffer_full_new = perf_event_count(cinfo->buffer_full_event);
+	cinfo->old_buffer_val = buffer_full_new;
+
 	//Communicate limit
 	cinfo->primary.limit = (void*) reg;
 	
@@ -450,10 +517,29 @@ static void spe_bw_manage_buffer(void *info)
 	}
 	// Mask COLL as we already checked it
 	reg = reg & ~BIT(SYS_PMBSR_EL1_COLL_SHIFT);
-	if(reg != 0){
+	if(reg != 0) {
 		pr_warn("spe_bw_manage_buffer(): SYS_PMBSR_EL1: %llx",reg);
-	} 
+		overrun = true;
+		process_record(cinfo->primary.limit - 64, &s);
+		pr_warn("Delay from last sample in buffer %lld us",
+			(s.timestamp_module - s.timestamp_spe)/125);
+	}
 
+	switch (reg & (SYS_PMBSR_EL1_EC_MASK << SYS_PMBSR_EL1_EC_SHIFT)) {
+	case SYS_PMBSR_EL1_EC_BUF:
+		/* Handled below */
+		break;
+	case SYS_PMBSR_EL1_EC_FAULT_S1:
+		pr_warn_ratelimited("S1 Fault");
+		break;
+	case SYS_PMBSR_EL1_EC_FAULT_S2:
+		pr_warn_ratelimited("S2 Fault");
+		break;
+	default:
+		pr_warn_ratelimited("Unknown error code");
+		break;
+	}
+	
 	write_sysreg_s(0, SYS_PMBSR_EL1);
 
 	//Allocate secondary_buffer
@@ -484,6 +570,12 @@ static void spe_bw_manage_buffer(void *info)
 			/ WATERMARK_DEN;
 	wmb();
 	cinfo->secondary.ready = 1;
+	if(overrun) {
+		pr_warn("Time to serve %lld us", 
+			(READ_CNTCPT_EL0() - s.timestamp_module)*32/1000);
+	}
+	//Restart counter
+	cinfo->buffer_full_event->pmu->start(cinfo->buffer_full_event, PERF_EF_RELOAD);
 	// Set other flags and start sampling
 	reg = spe_bw_fill_pmscr();
 	write_sysreg_s(reg, SYS_PMSCR_EL1);
@@ -749,6 +841,7 @@ static void spe_enable_cpu(void *info)
 	write_sysreg_s(0, SYS_PMBSR_EL1);
 	isb();
 
+	perf_event_enable(cinfo->buffer_full_event);
 	// Set other flags and start sampling
 	reg = spe_bw_fill_pmscr();
 	write_sysreg_s(reg, SYS_PMSCR_EL1);
@@ -759,23 +852,34 @@ static void spe_enable_cpu(void *info)
 
 static void spe_disable_cpu(void *info)
 {
-    /* Disable SPE */
-    u64 reg;
-    u64 pmblimitr;
-    struct spe_ctrl* spe_ctrl = (struct spe_ctrl*)info;
+	/* Disable SPE */
+	u64 reg;
+	u64 pmblimitr;
+	struct core_info *cinfo = this_cpu_ptr(core_info);
+	struct spe_ctrl* spe_ctrl = cinfo->s;
+	BUG_ON(!spe_ctrl);
 
-    disable_percpu_irq(spe_ctrl->irq);
+	disable_percpu_irq(spe_ctrl->irq);
 
-    pmblimitr = read_sysreg_s(SYS_PMBLIMITR_EL1);
-    write_sysreg_s(0, SYS_PMBLIMITR_EL1);
-    write_sysreg_s(read_sysreg_s(SYS_PMSCR_EL1) & ~1, SYS_PMSCR_EL1);
-    isb();
-    reg = read_sysreg_s(SYS_PMBSR_EL1);
-    PR_DEBUG("PMBSR_EL1 status: %llx\n",reg);
-    reg = read_sysreg_s(SYS_PMBPTR_EL1);
-    PR_DEBUG("SYS_PMBPTR_EL1 status: %llx\n", reg);
-    PR_DEBUG("SYS_PMBLIMITR_EL1 status: %llx\n", pmblimitr);
-    PR_DEBUG("The IRQ had been called %d times", irq_called);
+	pmblimitr = read_sysreg_s(SYS_PMBLIMITR_EL1);
+	write_sysreg_s(0, SYS_PMBLIMITR_EL1);
+
+	reg = read_sysreg_s(SYS_PMSCR_EL1);
+	reg = BIT_CLEAR(SYS_PMSCR_EL1_E0SPE, reg);
+	reg = BIT_CLEAR(SYS_PMSCR_EL1_E1SPE, reg);
+	write_sysreg_s(reg, SYS_PMSCR_EL1);
+	isb();
+
+	perf_event_disable(cinfo->buffer_full_event);
+	perf_event_release_kernel(cinfo->buffer_full_event); 
+	cinfo->buffer_full_event = NULL; 
+	
+	reg = read_sysreg_s(SYS_PMBSR_EL1);
+	PR_DEBUG("PMBSR_EL1 status: %llx\n",reg);
+	reg = read_sysreg_s(SYS_PMBPTR_EL1);
+	PR_DEBUG("SYS_PMBPTR_EL1 status: %llx\n", reg);
+	PR_DEBUG("SYS_PMBLIMITR_EL1 status: %llx\n", pmblimitr);
+	PR_DEBUG("The IRQ had been called %d times", irq_called);
 }
 
 #if CONFIG_PERF_OPTIMISED < 2
@@ -829,14 +933,6 @@ static void swap_spe_buffers(struct core_info *cinfo)
 	SWAP(cinfo->primary.watermark,cinfo->secondary.watermark);
 	smp_wmb();
 	cinfo->secondary.ready = 0;
-}
-
-static inline void request_buffer_maintenance(struct spe_ctrl *s, int cpu)
-{
-	int ret = smp_call_function_single(cpu, spe_bw_manage_buffer, s, 0);
-	if(ret != 0)
-		pr_warn("error in calling spe_bw_manage_buffer");
-
 }
 
 #if defined(CONFIG_TEST_BIN_ASSIGNMENT) && defined(CONFIG_BINARY_SEARCH)
@@ -1274,19 +1370,13 @@ static bool try_read_record(struct spe_ctrl *s,
 		}
 
 		elem = cinfo->primary.buf;
-		cinfo->primary.buf += 64UL;
+		cinfo->primary.buf += SPE_HW_SAMPLE_SIZE;
 		update_stats_arr(ts_before_process);
 
 		bin_sample(s, &sample);
 
 		if (spe_ring_push_sample_try(&(s->spe_ring[cpu]), elem) != 0)
 			overflowed_samples++;
-
-		//With the equal comparison, it will only trigger once
-		if (cinfo->primary.buf == cinfo->primary.watermark ) {
-			PR_TRACE("spe_reader():watermark hit\n");
-			request_buffer_maintenance(s,cpu);
-		}
 	}
 
 	// Restore a waiting buffer, if the secondary is ready
@@ -1352,6 +1442,50 @@ static void compute_stats(unsigned long long *read_delay_avg,
 	*proc_delay_err = *proc_delay_err / effective_saved_stats;
 }
 #endif
+
+static struct perf_event *init_counter(struct spe_ctrl *s, int cpu, int budget, int counter_id, void *callback)
+{
+	struct perf_event *event = NULL;
+	struct perf_event_attr sched_perf_hw_attr = {
+		.type		= PERF_TYPE_RAW,
+		.size		= sizeof(struct perf_event_attr),
+		.pinned		= 1,
+		.disabled	= 1,
+		.exclude_kernel = s->exclude_kernel,
+		.config		= counter_id,
+		.sample_period	= budget,
+	};
+
+	/* Try to register using hardware perf events */
+	event = perf_event_create_kernel_counter(
+		&sched_perf_hw_attr,
+		cpu, NULL,
+		callback
+#if LINUX_VERSION_CODE > KERNEL_VERSION(3, 2, 0)
+		, NULL
+#endif
+		);
+
+	if (!event)
+		return NULL;
+
+	if (IS_ERR(event)) {
+		/* vary the KERN level based on the returned errno */
+		if (PTR_ERR(event) == -EOPNOTSUPP)
+			pr_info("cpu%d. not supported\n", cpu);
+		else if (PTR_ERR(event) == -ENOENT)
+			pr_info("cpu%d. not h/w event\n", cpu);
+		else
+			pr_err("cpu%d. unable to create perf event: %ld\n",
+				cpu, PTR_ERR(event));
+		return NULL;
+	}
+
+	/* success path */
+	pr_info("cpu%d enabled counter 0x%x\n", cpu, counter_id);
+
+	return event;
+}
 
 static ssize_t sysfs_store_control(struct kobject *kobj,
 				struct kobj_attribute *attr,
@@ -1421,6 +1555,18 @@ static ssize_t sysfs_store_control(struct kobject *kobj,
 			};
 
 			cinfo->active_buffer = 0;
+			cinfo->s = &spe;
+			/* initialize nmi irq_work_queue */
+			init_irq_work(&cinfo->buffer_full_pending, spe_bw_manage_buffer);
+			cinfo->buffer_full_event = init_counter(&spe,
+						i,
+						spe.size/SPE_HW_SAMPLE_SIZE
+						*
+						WATERMARK_NUM/WATERMARK_DEN,
+						ARMV8_SPE_PERFCTR_SAMPLE_FILTRATE,
+						event_overflow_callback);
+			if(!cinfo->buffer_full_event)
+				alloc_failed = true;
 		}
 		if(alloc_failed){
 			for_each_cpu(i, spe.target_cpu){
