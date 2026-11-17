@@ -13,7 +13,7 @@ static int spe_ring_alloc(struct spe_ring_dev *ring)
 
 	size = sizeof(struct ring_header) +
 		ring->shared_entries * sizeof(struct ring_elem);
-	pr_info("allocatred shared spe_ring\n");
+	pr_info("allocated shared spe_ring\n");
 	shared_spe_ring = vmalloc_user(size);
 
 	if (!shared_spe_ring)

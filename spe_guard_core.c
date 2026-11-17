@@ -1,11 +1,5 @@
 
-#include <linux/bitfield.h>
-#include <linux/bitops.h>
 #include <linux/init.h>
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/printk.h> 
-
 #include <asm/cpufeature.h>
 #include <asm/sysreg.h>
 
@@ -51,7 +45,7 @@
 #define SPE_HW_SAMPLE_SIZE 64UL
 #define WATERMARK_NUM 15
 #define WATERMARK_DEN 16
-#define CONFIG_PERF_OPTIMISED 2
+#define CONFIG_PERF_OPTIMISED 0
 #define PKT_PAYLOAD_SZ_MASK (0x3)
 #define PKT_PAYLOAD_SZ_SHIFT (4)
 #define SYS_PMSCR_EL1_EE_SHIFT	8
@@ -133,7 +127,7 @@ enum spe_header_type
 	PKT_OP_TYPE_OTHER = 	0x48,
 	PKT_OP_TYPE_LDST = 	0x49,
 	PKT_OP_TYPE_BRANCH = 	0x4A,
-	PKT_OP_TYPE_RES0 = 	0x4B,	
+	PKT_OP_TYPE_RES0 = 	0x4B,
 	PKT_ADDR_SH_PC = 	0xB0,
 	PKT_ADDR_SH_B_TARGET = 	0xB1,
 	PKT_ADDR_SH_ACC_VA = 	0xB2,
@@ -161,6 +155,58 @@ enum spe_header_type
 	PKT_LONG_GENERIC_3 =	0x23,
 	PKT_UNINITIALISED =	0xFF,
 };
+
+/*
+ * TODO: In the first version, userspace push are done inside main loop.
+ * 	This makes READING useless. Is FILLING+FULL useless? Until now we
+ * 	managed it with the limit, now we can rely on state
+ * 	=> read limit only if state is full
+ * 	What if we get in interrupt and OTHER->state is not READY? Wait(?),
+ * 	Ok but only if our next is in MEMSET (then we are just going too fast),
+ * 	but it can also be in the others, we must wait.
+ * 	Previously, 2 state protocol: try_read_record clears ready bit,
+ * 	manage_buffer sets it. Is 6 states a mess for race condition? If I ensure
+ * 	only one context is allowed to do any given modification, does it make it
+ * 	contention free?
+ * 	Possible race condition on OTHER, since spe_guard changes active_buffer
+ * 	Active buffer can point to SPE owned?
+ * 	Every context has its own active:
+ * 	- reader_buffer owned by spe_reader only when FULL
+ * 	- reader_buffer owned by spe_engine when FILLING
+ * 	- reader changes limit only when it observes state change to FULL
+ * 	and relies on states.
+ * 	One possible problem found. When user calls stop on sysfs control iface,
+ * 	the spe_reader can get confused by the real limit and state.
+ * 	Currently, spe_disable_cpu doesn't touch the shared buffer. It just asks
+ * 	the kthread to stop. Then, the kthread waits for each buffer to be
+ * 	consumed. However, they still use the same limit value, or the reduced
+ * 	one, if it reached the watermark before. It is a bit a mess. The way it
+ * 	recognise if SPE is drained is if it reads nothing on any buffer. This
+ * 	can lose some samples but they are the last samples, we care relatively.
+ * 	Proposal: we set the buffer to FULL in spe_disable_cpu or we add a new
+ * 	state only for closure. How do we manage races between set to FULL and
+ * 	set to CLOSE? or to both setting FULL?
+ * 	I may have found a race bug. What if the irq triggers and we are already
+ * 	in stop? I think it may re-enable SPE. Continuing to produce. However,
+ * 	maybe the fact that spe_reader will stop can help, but does it stops?
+ * 	If spe_disable_cpu never sets anything, we stay with the same lossy
+ * 	behavior, but avoiding race conditions. The last state of the buffer
+ * 	can either be FULL or FILLING, and we need to understand how to manage
+ * 	all other threads using other buffers. READ should continue until all
+ * 	buffers are done, but MEMSET could be avoided (even if it is light, it
+ * 	should be enough to just don't start new ones). spe_reader seems to
+ * 	ignore the stop condition. I think we should consider it elsewhere, in
+ * 	some place where it deesn't break performance.
+ * Suppose
+ * 	READY -> FILLING In spe_enable_cpu (?)
+ * 	FILLING-> FULL done in management, if spe_guard gets to limit while
+ * 		still in FILLING, warning (interrupt too long/slow)
+ * 	FULL -> READING after swap buffers
+ * 	READING -> FREE (need callback that userspace is done?)
+ * 	FREE->READING set by memset callback, when we know it started
+ * 	READING -> READY set by memset callback, when it knows it is done
+ *
+*/
 enum buffer_state {
 	// Buffer read, but not yet in the memset state
 	FREE,
@@ -205,11 +251,6 @@ struct core_info{
 
 	struct spe_ctrl *s;
 	void *buffer_base;
-	/*
-	 * TODO: [IDEA] pass only core_info and have it pointing to 
-	 * global spe_ctrl
-	 * struct spe_ctrl *spe_ctrl;
-	*/
 };
 
 struct be_core_info {
@@ -290,6 +331,21 @@ enum spe_bw_buf_fault_action {
 	SPE_BW_BUF_FAULT_ACT_FATAL,
 	SPE_BW_BUF_FAULT_ACT_OK,
 };
+
+/*
+ * We need an array (later a tree ) for holding the bins, alternatively, can
+ * compute every time the correct bin, by doing (val - min) / bin_size
+ * I will need to count all binned values
+ * I should try two versions, by number of samples and by time
+ * When it is time to regulate, for each bin compute the aggregate sum O(n_bins)
+ * Divide by total num of sambles, then compare reference with measured.
+ *  If have to regulate check memguard
+ * Do I delete previous history at every 1 regulation period? yes, avoid overflow,
+ * no, have more precise history, then old history should go away when it is old
+ * enough, but also it would take more time to react.
+ * For now, I don't consider the time in the SPE domain, but only in module domain
+ * as it is easier.
+*/
 
 // This must be a power of 2
 static const size_t NUM_STATS_RECORDS=1<<(2+20);
@@ -411,7 +467,7 @@ static u64 spe_bw_fill_pmscr(void)
 	reg |= spe.pct_enable << SYS_PMSCR_EL1_PCT_SHIFT;
 	// Useless until not running on a FEAT_SPE_EXC cpu
 	reg |= 0x11 << SYS_PMSCR_EL1_EE_SHIFT;
-	
+
 	if (!spe.exclude_user)
 		reg |= BIT(SYS_PMSCR_EL1_E0SPE_SHIFT);
 
@@ -480,7 +536,7 @@ static void __stop_counter(void *info){}
 /** read current counter value. */
 static inline u64 perf_event_count(struct perf_event *event)
 {
-	return local64_read(&event->count) + 
+	return local64_read(&event->count) +
 		atomic64_read(&event->child_count);
 }
 /** return used event in the current period */
@@ -637,6 +693,8 @@ static void spe_bw_manage_buffer(struct irq_work *entry)
 	cinfo->old_buffer_val = buffer_full_new;
 
 	//Communicate limit
+	// Can I arrive here after calling CLOSE? I'd prefer not to.
+	// Let's check event_overflow doesn't post a CMD_MANAGE if it finds CMD_CLOSE
 	BUG_ON(spe_buffer_get_state(cur_buf) != FILLING);
 	spe_buffer_set_full(cur_buf, (void *)reg);
 
@@ -645,7 +703,7 @@ static void spe_bw_manage_buffer(struct irq_work *entry)
 	if(reg & BIT(SYS_PMBSR_EL1_COLL_SHIFT)){
 		/*
 		 * TODO: For now we don't care, however, we can levarege this
-		 * instead of the PMC to consider increasing the profiling 
+		 * instead of the PMC to consider increasing the profiling
 		 * period.
 		*/
 	}
@@ -688,15 +746,17 @@ static void spe_bw_manage_buffer(struct irq_work *entry)
 	reg = (u64)secondary_limit;
 	reg |= BIT(SYS_PMBLIMITR_EL1_E_SHIFT);
 	write_sysreg_s(reg, SYS_PMBLIMITR_EL1);
+	
 	isb();
 
 	if(overrun) {
-		pr_warn_ratelimited("Time to serve %lld us", 
+		pr_warn_ratelimited("Time to serve %lld us",
 			(READ_CNTCPT_EL0() - s.timestamp_module)*32/1000);
 	}
 	//Restart counter
 	cinfo->buffer_full_event->pmu->start(cinfo->buffer_full_event, PERF_EF_RELOAD);
 	// Set other flags and start sampling
+	// Be careful, the isb is beacause of this write, as they must be in order
 	reg = spe_bw_fill_pmscr();
 	write_sysreg_s(reg, SYS_PMSCR_EL1);
 	isb();
@@ -720,7 +780,7 @@ static inline void fill_sample_ts_spe(struct sample *s, u64 timestamp){}
 #ifdef CONFIG_SAMPLE_VADDR
 static inline void fill_sample_pc(struct sample *s, void *payload_addr)
 {
-	
+
 	s->pc = spe_bw_get_record_pc(payload_addr);
 }
 
@@ -782,7 +842,7 @@ static inline int process_record(void *base, struct sample *s)
 			header_size = 2;
 			payload_size = 1 << FIELD_GET_LOCAL(PKT_PAYLOAD_SZ,
 								header);
-			
+
 		}else{
 			header_size = 1;
 			payload_size = 1 << FIELD_GET_LOCAL(PKT_PAYLOAD_SZ,
@@ -895,20 +955,20 @@ static inline int process_record(void *base, struct sample *s)
 				pr_info_concat("%02X ",((u8*)base)[i] );
 			}
 			PR_DEBUG("%s\n", string_buffer);
-#endif				
+#endif
 			pr_debug("Unknown packet (%d B)(%x)", payload_size,header);
 			return -((int)header);
 		}
 #if CONFIG_PERF_OPTIMISED == 0
 		// This counts all non-padding packets
 		if(header != 0x00){
-			packets_found++;		
+			packets_found++;
 		}
 #endif
 		header_addr = header_addr + payload_size + header_size;
 	}
 #if CONFIG_PERF_OPTIMISED < 1
-	PR_DEBUG("Found %d packets\n", packets_found);
+	PR_TRACE("Found %d packets\n", packets_found);
 #endif
 	return 0;
 }
@@ -1127,7 +1187,7 @@ static void event_overflow_callback(struct perf_event *event,
 }
 
 #if CONFIG_PERF_OPTIMISED < 2
-static inline void update_stats_arr(unsigned long long ts_before_process) 
+static inline void update_stats_arr(unsigned long long ts_before_process)
 {
 	unsigned long long ts_after_process;
 	unsigned long long stats_arr_i;
@@ -1137,11 +1197,11 @@ static inline void update_stats_arr(unsigned long long ts_before_process)
 	isb();
 	ts_after_process = READ_CNTCPT_EL0();
 	stats_arr_i = read_records & (NUM_STATS_RECORDS-1);
-	ts_stats_arr[stats_arr_i].spe_reader_delay = 
+	ts_stats_arr[stats_arr_i].spe_reader_delay =
 		ts_before_process - last_ts ;
-	ts_stats_arr[stats_arr_i].reader_process_delay = 
+	ts_stats_arr[stats_arr_i].reader_process_delay =
 		ts_after_process - ts_before_process ;
-	timestamp_delta = timestamp_delta 
+	timestamp_delta = timestamp_delta
 				+ (ts_before_process - last_ts);
 }
 
@@ -1211,7 +1271,7 @@ static bool correct_assignment(int i, unsigned int latency)
 	bin_underflow = (i==0 && latency <= g_bin_edges[0]);
 	bin_overflow = (i==NUM_BINS-1 && latency >= g_bin_edges[NUM_BINS-1-1]);
 	normal_bin = (
-			(0<i && i<NUM_BINS-1) 
+			(0<i && i<NUM_BINS-1)
 			&& (g_bin_edges[i-1] < latency && latency <= g_bin_edges[i])
 		);
 	return (bin_underflow || bin_overflow || normal_bin);
@@ -1349,14 +1409,32 @@ static void post_regulation(struct spe_ctrl *s) {}
 #endif
 
 
-#if CONFIG_PERF_OPTIMISED < 2
-#define CDF_PRINT_LEN 1000
+/*
+ * As of now I can think about three options for treating the observed CDF
+ * 1) Delete all history at each regulation period
+ * 2) Keep always all history
+ * 	- This option should be the most guaranteeing, if the final distribution
+ * 	  is FOSD to the target, we know we did good, otherwise it is just a
+ * 	  proxy. However, building a statefull CDF induces latency in reaction
+ * 3) Progressively delete old history, for example halving the number of samples
+ * For now I choose option 1, even if 1 regulation period may not produce enough
+ * samples to be representative
+ *
+ * Promising idea: hybrid regulation with very short, less stateful regulation
+ * plus complete stateful and trustworthy long time regulation
+ *
+ * Here, first build observed CDF, then compare observed and target CDF, if ok
+ * don't do anyhting, else regulate
+ * In the end, treat observed distribution
+*/
+#if CONFIG_PERF_OPTIMISED < 1
+#define CDF_PRINT_LEN 1024
 static char str_buf[CDF_PRINT_LEN];
 int concat_cdf_value(char * buffer, unsigned long long value)
 {
 	return snprintf(buffer, CDF_PRINT_LEN-(buffer-str_buf)-1, "%lld,", value);
 }
-#else 
+#else
 char str_buf[] = {'\0'};
 int concat_cdf_value(char * buffer, unsigned long long value)
 {
@@ -1369,7 +1447,7 @@ int concat_cdf_value(char * buffer, unsigned long long value)
 #else
 #define LIMIT_TO_MEAN true
 #endif
-#ifdef CONFIG_REG_FULL_HIST 
+#ifdef CONFIG_REG_FULL_HIST
 
 #ifdef CONFIG_TAIL_INTEGRATION
 static bool throttle_cdf_comparison_loop(struct spe_ctrl *s,
@@ -1382,9 +1460,9 @@ static bool throttle_cdf_comparison_loop(struct spe_ctrl *s,
 		uint64_t term = (observed_cdf[NUM_BINS-1] - observed_cdf[i]) << s->bin_edges_bit[i];
 		acc += term;
 		if(	LIMIT_TO_MEAN &&
-			(acc * g_ref_num_samples 
+			(acc * g_ref_num_samples
 			> s->ref_integral[i] * observed_cdf[NUM_BINS-1])) {
-			PR_TRACE("Tail integration violate %lld/%lld > %lld at %d", 
+			PR_TRACE("Tail integration violate %lld/%lld > %lld at %d",
 					acc,observed_cdf[NUM_BINS-1],s->ref_integral[i], g_bin_edges[i]
 					);
 			return true;
@@ -1399,9 +1477,9 @@ static bool throttle_cdf_comparison_loop(struct spe_ctrl *s,
 	unsigned int i;
 	for(i = 0; i < NUM_BINS ; i++) {
 		//Should divide each CDF by num of samples, but instead we multiply by the other's divisor
-		if(observed_cdf[i] * g_ref_num_samples < 
+		if(observed_cdf[i] * g_ref_num_samples <
 			g_reference_cdf[i] * s->num_samples) {
-			PR_TRACE("FOSD violate %lld over %d < %ld over %d at %d", 
+			PR_TRACE("FOSD violate %lld over %d < %ld over %d at %d",
 					observed_cdf[i],s->num_samples,
 					g_reference_cdf[i],g_ref_num_samples,
 					i*BIN_WIDTH + MIN_TRACKED_LAT
@@ -1427,11 +1505,15 @@ static void evaluate_regulation(struct spe_ctrl *s)
 	for(i = 1; i < NUM_BINS ; i++){
 		observed_cdf[i] = observed_cdf[i-1] + s->latency_distr[i];
 		local_buf += concat_cdf_value(local_buf, observed_cdf[i]);
+		if (i > 0 && (i % 16 == 0)) {
+			PR_TRACE("%s",str_buf);
+			local_buf = str_buf;
+		}
 	}
-	PR_TRACE("CDF now: %s",str_buf);
+	PR_TRACE("observed_cdf[NUM_BINS-1]=%lld, s->num_samples=%d", observed_cdf[NUM_BINS-1], s->num_samples);
 
 	throttle_cores = throttle_cdf_comparison_loop(s, observed_cdf);
-
+	
 	if (throttle_cores && READ_ONCE(s->throttle_be_cpus)) {
 		// Do nothing, keep waiting
 		constant_period++;
@@ -1455,7 +1537,7 @@ static void evaluate_regulation(struct spe_ctrl *s)
 
 	post_regulation(s);
 }
-#endif 
+#endif
 
 #ifdef CONFIG_SLIDING_WIN
 #ifdef CONFIG_TAIL_INTEGRATION
@@ -1471,7 +1553,7 @@ static bool throttle_cdf_comparison_loop(struct spe_ctrl *s)
 			(	acc * g_reference_cdf[i]
 				> s->ref_integral[i]*s->prev_cdf[i])
 		) {
-			PR_TRACE("Tail integration violate %lld > %lld at %d", 
+			PR_TRACE("Tail integration violate %lld > %lld at %d",
 					acc,s->ref_integral[i], g_bin_edges[i]
 					);
 			return true;
@@ -1486,12 +1568,12 @@ static bool throttle_cdf_comparison_loop(struct spe_ctrl *s)
 	unsigned int num_samples = s->prev_cdf[NUM_BINS-1];
 	for(i = 0; i < NUM_BINS ; i++) {
 		/*
-		 * Should divide each CDF by num of samples, but instead we 
+		 * Should divide each CDF by num of samples, but instead we
 		 * multiply by the other's divisor
 		 */
 		if(s->prev_cdf[i] * g_ref_num_samples <
 			g_reference_cdf[i] * num_samples) {
-			PR_TRACE("FOSD violate %lld over %d < %ld over %d at %d", 
+			PR_TRACE("FOSD violate %lld over %d < %ld over %d at %d",
 					s->prev_cdf[i],s->num_samples,
 					g_reference_cdf[i],g_ref_num_samples,
 					i*BIN_WIDTH + MIN_TRACKED_LAT
@@ -1565,7 +1647,7 @@ static bool should_regulate(struct spe_ctrl *s)
 static void init_next_period(struct spe_ctrl *s)
 {
 
-	s->next_regulation_ns = ktime_get_boottime_ns() + 
+	s->next_regulation_ns = ktime_get_boottime_ns() +
 				NSEC_PER_USEC * g_regulation_period_us;
 	pr_info("Starting at: %lld", ktime_get_boottime_ns());
 	pr_info("Next period: %lld", s->next_regulation_ns);
@@ -1642,8 +1724,8 @@ static bool try_read_record(struct spe_ctrl *s,
 
 		ts_before_process = get_exact_cntpct();
 
-		ret = process_record(cinfo->primary.buf, &sample);
-
+		// ret = process_record(base, &sample);
+		ret = 0;
 		if(ret < 0){
 			PR_DEBUG("Unrecognised packet header: %x", (unsigned int)(-ret));
 			return -1;
@@ -1653,10 +1735,11 @@ static bool try_read_record(struct spe_ctrl *s,
 		spe_buffer_advance_buf(cur_buf);
 		update_stats_arr(ts_before_process);
 
-		bin_sample(s, &sample);
+		// bin_sample(s, &sample);
 
 		if (spe_ring_push_sample_try(&(s->spe_ring[cpu]), elem) != 0)
 			overflowed_samples++;
+
 	}
 	/*
 	 * TODO: here we do one additional call, becasue we checked on the
@@ -1800,6 +1883,27 @@ static ssize_t sysfs_store_control(struct kobject *kobj,
 		memset(spe.prev_cdf, 0, NUM_BINS*sizeof(*spe.prev_cdf));
 		memset(spe.cdf_hist,0,WINDOW_SIZE*NUM_BINS*sizeof(**spe.cdf_hist));
 
+		{
+		char *local_buf = str_buf;
+		for(i = 0; i < NUM_BINS ; i++){
+			local_buf += concat_cdf_value(local_buf, spe.ref_integral[i]);
+		}
+		PR_TRACE("Ref_integral now: %s",str_buf);
+		}
+		{
+		char *local_buf = str_buf;
+		for(i = 0; i < NUM_BINS ; i++){
+			local_buf += concat_cdf_value(local_buf, g_bin_edges[i]);
+		}
+		PR_TRACE("g_bin_edges now: %s",str_buf);
+		}
+		{
+		char *local_buf = str_buf;
+		for(i = 0; i < NUM_BINS ; i++){
+			local_buf += concat_cdf_value(local_buf, spe.bin_edges_bit[i]);
+		}
+		PR_TRACE("bin_edges_bit now: %s",str_buf);
+		}
 		spe.num_samples = 0;
 		spe.throttle_be_cpus = false;
 		if(cpumask_empty(&(spe.be_cpu))) {
@@ -1926,7 +2030,7 @@ static ssize_t sysfs_store_control(struct kobject *kobj,
 		spe.running = false;
 
 		pr_info("sysfs_store_control: SPE stopped\n");
-		pr_debug("sysfs_store_control: Found %d extended packets\n",extended_packets);	
+		pr_debug("sysfs_store_control: Found %d extended packets\n",extended_packets);
 		pr_debug("First TS seen: %lld, last TS seen: %lld\n", first_ts,last_ts);
 
 		pr_info("Over %lld period, we throttled %lld periods, and stayd the same for %lld periods", total_period, throttled_period, constant_period);
@@ -1940,9 +2044,9 @@ static ssize_t sysfs_store_control(struct kobject *kobj,
 			unsigned long long proc_delay_err = 0;
 			compute_stats( &read_delay_avg, &read_delay_err,
 					&proc_delay_avg, &proc_delay_err);
-			pr_info("Average delay in reception: %lld +- %lld\n", 
+			pr_info("Average delay in reception: %lld +- %lld\n",
 				read_delay_avg, read_delay_err);
-			pr_info("Average delay in processing: %lld +- %lld\n", 
+			pr_info("Average delay in processing: %lld +- %lld\n",
 				proc_delay_avg, proc_delay_err);
 		}
 #endif
@@ -2069,7 +2173,7 @@ out_stop:
 		kthread_stop(spe.reader_task);
 
 	/*
-	 * TODO: We just stopped the thread, so maybe freeing 
+	 * TODO: We just stopped the thread, so maybe freeing
 	 * already the buffer is too early
 	*/
 	kvfree(cinfo->buffer_base);
@@ -2083,11 +2187,11 @@ out_stop:
 static irqreturn_t spe_bw_irq_handler(int irq, void *dev)
 {
 	struct core_info *cinfo = this_cpu_ptr(core_info);
-	
+
 	enum spe_bw_buf_fault_action act;
 	if (!cinfo->buffer_base)
 		return IRQ_NONE;
-	
+
 	pr_info("Irq called\n");
 	act = spe_bw_buf_fault_act_get(cinfo);
 	if (act == SPE_BW_BUF_FAULT_ACT_SPURIOUS)
@@ -2165,8 +2269,8 @@ static int spe_bw_device_probe(struct platform_device *pdev)
 
 	spe_ctrl->pdev = pdev;
 	/*
-	 * Only needed if allocating stuff inside probe, as from remove we 
-	 * would not have it 
+	 * Only needed if allocating stuff inside probe, as from remove we
+	 * would not have it
 	 */
 	platform_set_drvdata(pdev, spe_ctrl);
 
@@ -2199,12 +2303,12 @@ free_irq:
 	free_percpu_irq(spe_ctrl->irq, spe_ctrl);
 
 //out_teardown_dev:
-	// Again, only when will allocate here 
+	// Again, only when will allocate here
 	//arm_spe_pmu_dev_teardown(spe_pmu);
 //out_free_handle:
 	//Again, only when will allocate per cpu
 	//free_percpu(spe_ctrl->handle);
-	
+
 clean_exit:
 	PR_DEBUG("Something wrong in probe\n");
 	return ret;
@@ -2236,7 +2340,7 @@ static struct platform_driver spe_bw_driver = {
 	},
 	.probe	= spe_bw_device_probe,
 	// No dynamic allocation to free
-	.remove	= spe_bw_device_remove, 
+	.remove	= spe_bw_device_remove,
 };
 
 static struct notifier_block spe_pm_nb = {
@@ -2248,7 +2352,7 @@ static void enable_el0_cntpct(void *data){
 	pr_debug("CPU %d:: SYS_CNTKCTL_EL1: %llx\n",smp_processor_id(), reg);
 	// Setting EL0PCTEN bit
 	reg |= BIT(0);
-	write_sysreg_s(reg, SYS_CNTKCTL_EL1); 
+	write_sysreg_s(reg, SYS_CNTKCTL_EL1);
 }
 
 #if defined(CONFIG_VARIABLE_BIN) && defined(CONFIG_TAIL_INTEGRATION)
@@ -2293,7 +2397,7 @@ static bool validate_g_bin_edge(void)
 		unsigned int width = g_bin_edges[i+1] - g_bin_edges[i];
 		// Check if width is power of 2
 		if (width == 0 || (width & (width - 1)) != 0) {
-			pr_err("Bin width %u between edges %u and %u is not power of 2\n", 
+			pr_err("Bin width %u between edges %u and %u is not power of 2\n",
 				width, g_bin_edges[i], g_bin_edges[i+1]);
 			return false;
 		}
@@ -2306,7 +2410,7 @@ static bool validate_g_bin_edge(void) {return true;}
 #endif
 
 /*
- * Check if g_bin_edges is set, otherwise set known good values, and validate 
+ * Check if g_bin_edges is set, otherwise set known good values, and validate
  * for integration
  */
 static bool g_bin_edge_init(void)
@@ -2334,7 +2438,7 @@ static void precompute_ref_integral(struct spe_ctrl* s)
 	uint32_t acc = 0;
 	for (i = NUM_BINS - 1 - 1; i >= 0; i--) {
 		// Reference CDF is scaled to SAMPLES_WINDOW
-		uint32_t term = (g_reference_cdf[NUM_BINS-1] - g_reference_cdf[i]) 
+		uint32_t term = (g_reference_cdf[NUM_BINS-1] - g_reference_cdf[i])
 				<< s->bin_edges_bit[i];
 		acc += term;
 		s->ref_integral[i] = acc;
@@ -2373,7 +2477,7 @@ static int __init spe_guard_init(void)
 	//reg = read_sysreg_s(SYS_CNTPCT_EL0) - reg;
 	asm volatile("mrs %0, cntpct_el0" : "=r" (reg_after));
 	pr_debug("Slept for %llu clocks", reg_after - reg);
-	
+
 	reg = read_sysreg_s(SYS_PMBIDR_EL1);
 	pr_debug("SYS_PMBIDR_EL1=%08llx/n",reg);
 	reg = read_sysreg_s(SYS_PMBIDR_EL1);
@@ -2486,7 +2590,7 @@ static int __init spe_guard_init(void)
 		ret = -ENOMEM;
 		goto clean_exit;
 	}
-		
+
 	global->filter_ld = g_filt_load;
 	global->filter_st = g_filt_store;
 	global->ts_enable = true;
@@ -2495,12 +2599,12 @@ static int __init spe_guard_init(void)
 	global->exclude_user = false;
 	global->exclude_kernel = !g_record_kernel;
 	global->cx_enable = true;
-	
+
 	global->period = g_profiling_period;
 	global->advance = 0;
 
 	global->min_tracked_lat = MIN_TRACKED_LAT;
-	//TODO: better check of input array 
+	//TODO: better check of input array
 	//TODO: check highest is 100
 	//TODO: add  min/max bin as parameter
 	if(g_ref_cdf_len != NUM_BINS || g_var_bin_len != NUM_BINS)
@@ -2543,7 +2647,7 @@ static int __init spe_guard_init(void)
 	}
 
 	spe_bw_init_debugfs();
-	
+
 	ret = platform_driver_register(&spe_bw_driver);
 	if(ret){
 		ret = -ret;
@@ -2559,9 +2663,9 @@ failed_file_creation:
 	sysfs_remove_file(spe_kobj, &be_cpu_attr.attr);
 	sysfs_remove_file(spe_kobj, &reader_cpu_attr.attr);
 	sysfs_remove_file(spe_kobj, &text_section_attr.attr);
-	
+
 	kobject_put(spe_kobj);
-	
+
 free_ts_stats:
 	kvfree(ts_stats_arr);
 
