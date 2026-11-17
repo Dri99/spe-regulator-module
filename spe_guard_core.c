@@ -1,11 +1,5 @@
 
-#include <linux/bitfield.h>
-#include <linux/bitops.h>
 #include <linux/init.h>
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/printk.h> 
-
 #include <asm/cpufeature.h>
 #include <asm/sysreg.h>
 
@@ -97,7 +91,8 @@ do {				\
 #define PR_DEBUG(...) pr_debug(__VA_ARGS__)
 #endif
 
-#define OTHER_BUFFER(active_one) ((active_one + 1) % 2)
+#define NUM_BUFFERS 4
+#define OTHER_BUFFER(active_one) ((active_one + 1) % NUM_BUFFERS)
 
 /**************************************************************************
  * Public Types
@@ -159,17 +154,83 @@ enum spe_header_type
 	PKT_UNINITIALISED =	0xFF,
 };
 
+/*
+ * TODO: In the first version, userspace push are done inside main loop.
+ * 	This makes READING useless. Is FILLING+FULL useless? Until now we
+ * 	managed it with the limit, now we can rely on state
+ * 	=> read limit only if state is full
+ * 	What if we get in interrupt and OTHER->state is not READY? Wait(?),
+ * 	Ok but only if our next is in MEMSET (then we are just going too fast),
+ * 	but it can also be in the others, we must wait.
+ * 	Previously, 2 state protocol: try_read_record clears ready bit,
+ * 	manage_buffer sets it. Is 6 states a mess for race condition? If I ensure
+ * 	only one context is allowed to do any given modification, does it make it
+ * 	contention free?
+ * 	Possible race condition on OTHER, since spe_guard changes active_buffer
+ * 	Active buffer can point to SPE owned? 
+ * 	Every context has its own active:
+ * 	- reader_buffer owned by spe_reader only when FULL
+ * 	- reader_buffer owned by spe_engine when FILLING
+ * 	- reader changes limit only when it observes state change to FULL
+ * 	and relies on states.
+ * 	One possible problem found. When user calls stop on sysfs control iface,
+ * 	the spe_reader can get confused by the real limit and state. 
+ * 	Currently, spe_disable_cpu doesn't touch the shared buffer. It just asks
+ * 	the kthread to stop. Then, the kthread waits for each buffer to be 
+ * 	consumed. However, they still use the same limit value, or the reduced
+ * 	one, if it reached the watermark before. It is a bit a mess. The way it 
+ * 	recognise if SPE is drained is if it reads nothing on any buffer. This 
+ * 	can lose some samples but they are the last samples, we care relatively.
+ * 	Proposal: we set the buffer to FULL in spe_disable_cpu or we add a new 
+ * 	state only for closure. How do we manage races between set to FULL and 
+ * 	set to CLOSE? or to both setting FULL?
+ * 	I may have found a race bug. What if the irq triggers and we are already 
+ * 	in stop? I think it may re-enable SPE. Continuing to produce. However, 
+ * 	maybe the fact that spe_reader will stop can help, but does it stops?
+ * 	If spe_disable_cpu never sets anything, we stay with the same lossy 
+ * 	behavior, but avoiding race conditions. The last state of the buffer 
+ * 	can either be FULL or FILLING, and we need to understand how to manage
+ * 	all other threads using other buffers. READ should continue until all 
+ * 	buffers are done, but MEMSET could be avoided (even if it is light, it
+ * 	should be enough to just don't start new ones). spe_reader seems to 
+ * 	ignore the stop condition. I think we should consider it elsewhere, in 
+ * 	some place where it deesn't break performance.
+ * Suppose  
+ * 	READY -> FILLING In spe_enable_cpu (?)
+ * 	FILLING-> FULL done in management, if spe_guard gets to limit while 
+ * 		still in FILLING, warning (interrupt too long/slow)
+ * 	FULL -> READING after swap buffers
+ * 	READING -> FREE (need callback that userspace is done?)
+ * 	FREE->READING set by memset callback, when we know it started
+ * 	READING -> READY set by memset callback, when it knows it is done
+ * 	
+*/
+enum buffer_state {
+	// Buffer read, but not yet in the memset state
+	FREE,
+	// SPE engine AND spe_guard on this buffer
+	FILLING,
+	// Only spe_guard on this buffer, consuming the tail
+	FULL,
+	// Only userspace on this buffer, writing to file
+	READING,
+	// Only memset engine (be_core or DMA)
+	MEMSET,
+	// Nobody on it, available to SPE/spe_guard
+	READY,
+};
+
 struct spe_buffer {
 	void *buf;
 	void *limit;
 	void *watermark;
-	char ready;
+	enum buffer_state state;
 };
 
 struct core_info{
-	struct spe_buffer primary;
-	struct spe_buffer secondary;
-	unsigned int active_buffer;
+	struct spe_buffer *buffers;
+	unsigned int reader_buffer;
+	unsigned int spe_engine_buffer;
 	struct perf_event *buffer_full_event;
 	struct irq_work	buffer_full_pending;  /* delayed work for NMIs */
 	
@@ -185,7 +246,9 @@ struct core_info{
 struct be_core_info {
 	bool is_throttled;
 	struct irq_work throttled_context;
+	struct irq_work page_init;
 	struct spe_ctrl *s;
+	void* buffer_to_set;
 };
 
 #define NUM_BINS 256
@@ -256,6 +319,21 @@ enum spe_bw_buf_fault_action {
 	SPE_BW_BUF_FAULT_ACT_FATAL,
 	SPE_BW_BUF_FAULT_ACT_OK,
 };
+
+/*
+ * We need an array (later a tree ) for holding the bins, alternatively, can 
+ * compute every time the correct bin, by doing (val - min) / bin_size
+ * I will need to count all binned values
+ * I should try two versions, by number of samples and by time
+ * When it is time to regulate, for each bin compute the aggregate sum O(n_bins)
+ * Divide by total num of sambles, then compare reference with measured.
+ *  If have to regulate check memguard
+ * Do I delete previous history at every 1 regulation period? yes, avoid overflow,
+ * no, have more precise history, then old history should go away when it is old
+ * enough, but also it would take more time to react.
+ * For now, I don't consider the time in the SPE domain, but only in module domain
+ * as it is easier.
+*/
 
 // This must be a power of 2
 static const size_t NUM_STATS_RECORDS=1<<(2+20);
@@ -466,6 +544,34 @@ static inline u64 perf_event_count(struct perf_event *event)
 		atomic64_read(&event->child_count);
 }
 
+static void spe_guard_buffer_set_full(struct spe_buffer *buffer, void *limit) 
+{
+	enum buffer_state state;
+	state = smp_load_acquire(buffer->state);
+	BUG_ON(state != FILLING);
+	buffer->limit = limit;
+	smp_store_release(buffer->state,FULL);
+
+}
+
+// The setting of state FILLING is before it is really activated by SPE
+static void spe_guard_buffer_set_filling(struct spe_buffer *buffer, 
+					void **base,
+					void **limit) 
+{
+	enum buffer_state state;
+	
+	while ((state = smp_load_acquire(buffer->state)) != READY) {
+		pr_warn_ratelimited("Buffer not yet READY")
+		cpu_relax();
+	}
+	BUG_ON(state != READY);
+	*base = buffer->buf;
+	*limit = buffer->limit;
+	smp_store_release(buffer->state, FILLING);
+
+}
+
 static void spe_bw_manage_buffer(void *info)
 //TODO: To convert to irq_work
 // static void spe_bw_manage_buffer(struct irq_work *entry)
@@ -488,10 +594,11 @@ static void spe_bw_manage_buffer(void *info)
 	cinfo->buffer_full_event->pmu->stop(cinfo->buffer_full_event, PERF_EF_UPDATE);
 	reg = read_sysreg_s(SYS_PMBPTR_EL1);
 	pr_info("spe_bw_manage_buffer: samples by SYS_PMBPTR_EL1:%lld by PMU: %lld\n", 
-		(reg-((u64)cinfo->primary.buf))/SPE_HW_SAMPLE_SIZE,
+		(reg-((u64)cinfo->buffers[cinfo->spe_engine_buffer].buf))/SPE_HW_SAMPLE_SIZE,
 		perf_event_count(cinfo->buffer_full_event));
 	//Communicate limit
-	cinfo->primary.limit = (void*) reg;
+	spe_guard_buffer_set_full(&(cinfo->buffers[cinfo->spe_engine_buffer]), 
+					(void *)reg);
 	
 	reg = read_sysreg_s(SYS_PMBSR_EL1);
 	//TODO: Missing check for syndrome
@@ -507,7 +614,7 @@ static void spe_bw_manage_buffer(void *info)
 	if(reg != 0) {
 		pr_warn("spe_bw_manage_buffer(): SYS_PMBSR_EL1: %llx",reg);
 		overrun = true;
-		process_record(cinfo->primary.limit - 64, &s);
+		process_record(cinfo->buffers[cinfo->reader_buffer].limit - 64, &s);
 		pr_warn("Delay from last sample in buffer %lld us",
 			(s.timestamp_module - s.timestamp_spe)/125);
 	}
@@ -530,33 +637,21 @@ static void spe_bw_manage_buffer(void *info)
 	write_sysreg_s(0, SYS_PMBSR_EL1);
 
 	//Allocate secondary_buffer
-	secondary_buf = cinfo->buffer_base
-			+ OTHER_BUFFER(cinfo->active_buffer) 
-			* spe_ctrl->size;
-	/*
-	 * TODO: This memset is potentially expensive, and should not be used in
-	 * irq context. I should have to either make it done by a DMA, or 
-	 * initialise a worker thread.
-	*/
-	memset(secondary_buf,0xff,spe_ctrl->size);
-	secondary_limit = secondary_buf + spe_ctrl->size;
-	// Ensure memset is completed
-	wmb();
+	
+	cinfo->spe_engine_buffer = OTHER_BUFFER(cinfo->spe_engine_buffer);
+	spe_guard_buffer_set_filling(&(cinfo->buffers[cinfo->spe_engine_buffer]),
+					&secondary_buf, 
+					&secondary_limit);
+	
+
 	write_sysreg_s(secondary_buf, SYS_PMBPTR_EL1);
 
 	reg = (u64)secondary_limit;
 	reg |= BIT(SYS_PMBLIMITR_EL1_E_SHIFT);
 	write_sysreg_s(reg, SYS_PMBLIMITR_EL1);
+	
 	isb();
 
-	cinfo->secondary.buf = secondary_buf;
-	cinfo->secondary.limit = secondary_limit;
-	cinfo->secondary.watermark = secondary_buf 
-			+ (spe_ctrl->size)
-			* WATERMARK_NUM
-			/ WATERMARK_DEN;
-	wmb();
-	cinfo->secondary.ready = 1;
 	if(overrun) {
 		pr_warn("Time to serve %lld us", 
 			(READ_CNTCPT_EL0() - s.timestamp_module)*32/1000);
@@ -564,6 +659,7 @@ static void spe_bw_manage_buffer(void *info)
 	//Restart counter
 	cinfo->buffer_full_event->pmu->start(cinfo->buffer_full_event, PERF_EF_RELOAD);
 	// Set other flags and start sampling
+	// Be careful, the isb is beacause of this write, as they must be in order 
 	reg = spe_bw_fill_pmscr();
 	write_sysreg_s(reg, SYS_PMSCR_EL1);
 	isb();
@@ -786,6 +882,7 @@ static void spe_enable_cpu(void *info)
 {
 	struct spe_ctrl *s = info;
 	u64 reg = 0;
+	void *buffer, *limit;
 	struct core_info *cinfo = this_cpu_ptr(core_info);
 	smp_rmb();
 	pr_info("cpu %d : spe_enable",smp_processor_id());
@@ -814,9 +911,12 @@ static void spe_enable_cpu(void *info)
 	write_sysreg_s(reg, SYS_PMSIRR_EL1);
 	
 	/* Program SPE buffer registers */
-	write_sysreg_s(cinfo->primary.buf, SYS_PMBPTR_EL1);
+	spe_guard_buffer_set_filling(cinfo->buffers[cinfo->spe_engine_buffer],
+					&buffer,
+					&limit);
+	write_sysreg_s(buffer, SYS_PMBPTR_EL1);
 
-	reg = (u64)(cinfo->primary.limit);
+	reg = (u64)(limit);
 	reg |= BIT(SYS_PMBLIMITR_EL1_E_SHIFT);
 	write_sysreg_s(reg, SYS_PMBLIMITR_EL1);
 	isb();
@@ -914,12 +1014,14 @@ static unsigned long get_exact_cntpct(void)
 
 static void swap_spe_buffers(struct core_info *cinfo)
 {
+	/*
+	 * TODO: We should either make this modification available to all 
+	 	contexts, or ensure we are the only ones using it.
+	 */
 	cinfo->active_buffer = OTHER_BUFFER(cinfo->active_buffer);
-	SWAP(cinfo->primary.buf,cinfo->secondary.buf);
-	SWAP(cinfo->primary.limit,cinfo->secondary.limit);
-	SWAP(cinfo->primary.watermark,cinfo->secondary.watermark);
 	smp_wmb();
 	cinfo->secondary.ready = 0;
+	// TODO: This is a good time to trigger flush to userspace
 }
 
 static inline void request_buffer_maintenance(struct spe_ctrl *s, int cpu)
@@ -1036,6 +1138,20 @@ static void throttle_thread(void* info)
 	PR_TRACE("Throttling cpu %d...",smp_processor_id());
 }
 
+static void memset_buffer(struct irq_work *entry) {
+	struct spe_buffer *to_set;
+	struct be_core_info *cinfo = this_cpu_ptr(be_core_info);
+	BUG_ON(to_set == NULL ||  to_set->state!=FREE);
+	to_set->state = MEMSET;
+	//TODO: Here I should have 
+	memset(to_set->buf,0xff,spe_ctrl->size);
+	
+	secondary_limit = secondary_buf + spe_ctrl->size;
+	wmb();
+	cinfo->buffers[cinfo->]
+	
+}
+
 static void throttle_thread_soft(struct irq_work *entry) {
 	//TODO: To be done
 	u64 end;
@@ -1077,8 +1193,26 @@ static void post_regulation(struct spe_ctrl *s) {}
 #endif
 
 
-#if CONFIG_PERF_OPTIMISED < 2
-#define CDF_PRINT_LEN 1000
+/*
+ * As of now I can think about three options for treating the observed CDF
+ * 1) Delete all history at each regulation period
+ * 2) Keep always all history
+ * 	- This option should be the most guaranteeing, if the final distribution
+ * 	  is FOSD to the target, we know we did good, otherwise it is just a 
+ * 	  proxy. However, building a statefull CDF induces latency in reaction
+ * 3) Progressively delete old history, for example halving the number of samples
+ * For now I choose option 1, even if 1 regulation period may not produce enough
+ * samples to be representative
+ * 
+ * Promising idea: hybrid regulation with very short, less stateful regulation
+ * plus complete stateful and trustworthy long time regulation
+ * 
+ * Here, first build observed CDF, then compare observed and target CDF, if ok
+ * don't do anyhting, else regulate
+ * In the end, treat observed distribution
+*/
+#if CONFIG_PERF_OPTIMISED < 1
+#define CDF_PRINT_LEN 1024
 static char str_buf[CDF_PRINT_LEN];
 int concat_cdf_value(char * buffer, unsigned long long value)
 {
@@ -1155,11 +1289,15 @@ static void evaluate_regulation(struct spe_ctrl *s)
 	for(i = 1; i < NUM_BINS ; i++){
 		observed_cdf[i] = observed_cdf[i-1] + s->latency_distr[i];
 		local_buf += concat_cdf_value(local_buf, observed_cdf[i]);
+		if (i > 0 && (i % 16 == 0)) {
+			PR_TRACE("%s",str_buf);
+			local_buf = str_buf;
+		}
 	}
-	PR_TRACE("CDF now: %s",str_buf);
+	PR_TRACE("observed_cdf[NUM_BINS-1]=%lld, s->num_samples=%d", observed_cdf[NUM_BINS-1], s->num_samples);
 
 	throttle_cores = throttle_cdf_comparison_loop(s, observed_cdf);
-
+	
 	if (throttle_cores && READ_ONCE(s->throttle_be_cpus)) {
 		// Do nothing, keep waiting
 		constant_period++;
@@ -1346,42 +1484,44 @@ static bool try_read_record(struct spe_ctrl *s,
 		* spe_buf::limit can change out of the control of
 		* current thread's control.
 	*/
-	void *limit = READ_ONCE(cinfo->primary.limit);
-	u64 next_to_read = READ_ONCE(*(u64 *)(cinfo->primary.buf + s->advance));
+	void *limit = READ_ONCE(cinfo->buffers[cinfo->active_buffer].limit);
+	u64 next_to_read = READ_ONCE(*(u64 *)(cinfo->buffers[cinfo->active_buffer].buf + s->advance));
 	//TODO: evaluate this barrier, maybe it can be removed
 	smp_rmb();
-	if (cinfo->primary.buf < limit &&
+	if (cinfo->buffers[cinfo->active_buffer].buf < limit &&
 		next_to_read != ones_mask)
 	{
-		PR_TRACE("SPE record at %llx\n",(u64) cinfo->primary.buf);
+		PR_TRACE("SPE record at %llx\n",(u64) cinfo->buffers[cinfo->active_buffer].buf);
 
 		ts_before_process = get_exact_cntpct();
 
-		ret = process_record(cinfo->primary.buf, &sample);
-
+		// ret = process_record(cinfo->buffers[cinfo->active_buffer].buf, &sample);
+		ret = 0;
 		if(ret < 0){
 			PR_DEBUG("Unrecognised packet header: %x", (unsigned int)(-ret));
 			return -1;
 		}
 
-		elem = cinfo->primary.buf;
-		cinfo->primary.buf += SPE_HW_SAMPLE_SIZE;
+		elem = cinfo->buffers[cinfo->active_buffer].buf;
+		cinfo->buffers[cinfo->active_buffer].buf += SPE_HW_SAMPLE_SIZE;
 		update_stats_arr(ts_before_process);
 
-		bin_sample(s, &sample);
+		// bin_sample(s, &sample);
 
 		if (spe_ring_push_sample_try(&(s->spe_ring[cpu]), elem) != 0)
 			overflowed_samples++;
 
 		//With the equal comparison, it will only trigger once
-		if (cinfo->primary.buf == cinfo->primary.watermark ) {
+		if (	cinfo->buffers[cinfo->active_buffer].buf 
+			== cinfo->buffers[cinfo->active_buffer].watermark ) {
 			PR_TRACE("spe_reader():watermark hit\n");
 			request_buffer_maintenance(s,cpu);
 		}
 	}
 
 	// Restore a waiting buffer, if the secondary is ready
-	if(cinfo->primary.buf == limit && READ_ONCE(cinfo->secondary.ready))
+	if(cinfo->primary.buf == limit && 
+		READ_ONCE(cinfo->buffers[OTHER_BUFFER(cinfo->active_buffer)].state)==READY)
 		swap_spe_buffers(cinfo);
 	return (ret == 0);
 }
@@ -1516,11 +1656,33 @@ static ssize_t sysfs_store_control(struct kobject *kobj,
 		memset(spe.prev_cdf, 0, NUM_BINS*sizeof(*spe.prev_cdf));
 		memset(spe.cdf_hist,0,WINDOW_SIZE*NUM_BINS*sizeof(**spe.cdf_hist));
 
+		{
+		char *local_buf = str_buf;
+		for(i = 0; i < NUM_BINS ; i++){
+			local_buf += concat_cdf_value(local_buf, spe.ref_integral[i]);
+		}
+		PR_TRACE("Ref_integral now: %s",str_buf);
+		}
+		{
+		char *local_buf = str_buf;
+		for(i = 0; i < NUM_BINS ; i++){
+			local_buf += concat_cdf_value(local_buf, g_bin_edges[i]);
+		}
+		PR_TRACE("g_bin_edges now: %s",str_buf);
+		}
+		{
+		char *local_buf = str_buf;
+		for(i = 0; i < NUM_BINS ; i++){
+			local_buf += concat_cdf_value(local_buf, spe.bin_edges_bit[i]);
+		}
+		PR_TRACE("bin_edges_bit now: %s",str_buf);
+		}
 		spe.num_samples = 0;
 		spe.throttle_be_cpus = false;
 		for_each_cpu(i, spe.be_cpu) {
 			struct be_core_info *cinfo = per_cpu_ptr(be_core_info,i);
 			init_irq_work(&cinfo->throttled_context, throttle_thread_soft);
+			init_irq_work(&cinfo->page_init, throttle_thread_soft);
 			cinfo->s = &spe;
 		}
 		for_each_cpu(i, spe.target_cpu){
