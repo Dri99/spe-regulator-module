@@ -49,7 +49,7 @@
 #define BUFFER_SIZE (1 << 21)
 #define SPE_BW_PERIOD 512
 #define SPE_HW_SAMPLE_SIZE 64UL
-#define WATERMARK_NUM 8
+#define WATERMARK_NUM 15
 #define WATERMARK_DEN 16
 #define CONFIG_PERF_OPTIMISED 2
 #define PKT_PAYLOAD_SZ_MASK (0x3)
@@ -205,6 +205,7 @@ struct be_core_info {
 #define WINDOW_SIZE NUM_BLOCKS_IN_WINDOW
 
 #define MIN_THROTTLE_US 10U
+#define MAX_SOFTIRQ_WAIT_MS 10U
 
 struct spe_ctrl {
 	size_t size;
@@ -476,12 +477,13 @@ static void spe_bw_manage_buffer(struct irq_work *entry)
 	u64 buffer_full_new;
 	struct sample s;
 	bool overrun = false;
+	u64 end_wait_time;
 
 	spe_ctrl = cinfo->s;
 	BUG_ON(!spe_ctrl);
 
 	spe_bw_management_called[cpu]++;
-	pr_debug("Management function triggered on cpu %d", cpu);
+	PR_TRACE("Management function triggered on cpu %d", cpu);
 	spe_bw_disable_and_drain_local();
 
 	cinfo->buffer_full_event->pmu->stop(cinfo->buffer_full_event, PERF_EF_UPDATE);
@@ -503,9 +505,33 @@ static void spe_bw_manage_buffer(struct irq_work *entry)
 	buffer_full_new = perf_event_count(cinfo->buffer_full_event);
 	cinfo->old_buffer_val = buffer_full_new;
 
+	// TODO:If received an exit request, it shouldn't start on a new buffer
+	if (!READ_ONCE(spe_ctrl->running)) {
+		pr_warn("spe_bw_manage_buffer():: IRQ called but we should be stopped");
+	}
+	/*
+	 * WARN: If spe_engine is really fast, it can re-trigger twice even before
+	 * spe_reader does swap_spe_buffers. spe_engine recognises it from ready
+	 * field already at 1, and waits for it to be 0 before proceeding.
+	 * Here waiting is not a problem because it runs in soft_irq, but
+	 * limited to MAX_SOFTIRQ_WAIT_MS. If anytime this limit is passed,
+	 * we should stop instead of overwriting a possibly used buffer.
+	 * The risk is to change twice the limit on the same buffer,
+	 * locking spe_reader
+	*/
+	end_wait_time = ktime_get_boottime_ns()
+			+ NSEC_PER_MSEC * MAX_SOFTIRQ_WAIT_MS;
+	while (READ_ONCE(cinfo->secondary.ready) == 1) {
+		cpu_relax();
+		if (ktime_get_boottime_ns() > end_wait_time) {
+			pr_warn("spe_bw_manage_buffer()::Waiting too much, spe_reader stops for safety");
+			return;
+		}
+	}
+
 	//Communicate limit
 	cinfo->primary.limit = (void*) reg;
-	
+
 	reg = read_sysreg_s(SYS_PMBSR_EL1);
 	//TODO: Missing check for syndrome
 	if(reg & BIT(SYS_PMBSR_EL1_COLL_SHIFT)){
@@ -571,7 +597,7 @@ static void spe_bw_manage_buffer(struct irq_work *entry)
 	wmb();
 	cinfo->secondary.ready = 1;
 	if(overrun) {
-		pr_warn("Time to serve %lld us", 
+		pr_warn_ratelimited("Time to serve %lld us", 
 			(READ_CNTCPT_EL0() - s.timestamp_module)*32/1000);
 	}
 	//Restart counter
