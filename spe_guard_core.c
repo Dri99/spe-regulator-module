@@ -97,7 +97,10 @@ do {				\
 #define PR_DEBUG(...) pr_debug(__VA_ARGS__)
 #endif
 
-#define OTHER_BUFFER(active_one) ((active_one + 1) % 2)
+#define NUM_BUFFERS 4
+#define OTHER_BUFFER(active_one) ((active_one + 1) % NUM_BUFFERS)
+#define BUG_ON(cond) { if( (cond) ) {pr_warn(#cond" failed");}}
+#define TEST(cond) ((cond)? "true" : "false")
 
 /**************************************************************************
  * Public Types
@@ -158,22 +161,48 @@ enum spe_header_type
 	PKT_LONG_GENERIC_3 =	0x23,
 	PKT_UNINITIALISED =	0xFF,
 };
+enum buffer_state {
+	// Buffer read, but not yet in the memset state
+	FREE,
+	// SPE engine AND spe_guard on this buffer
+	FILLING,
+	// Only spe_guard on this buffer, consuming the tail
+	FULL,
+	// Only userspace on this buffer, writing to file
+	READING,
+	// Only memset engine (be_core or DMA)
+	MEMSET,
+	// Nobody on it, available to SPE/spe_guard
+	READY,
+	// Last buffer to be filled, similar to FULL, but set by spe_disable_cpu
+	CLOSE,
+};
+
+enum spe_work_cmd {
+	CMD_NONE,
+	CMD_ENABLE,
+	CMD_MANAGE,
+	CMD_SHUTDOWN
+};
 
 struct spe_buffer {
 	void *buf;
 	void *limit;
-	void *watermark;
-	char ready;
+	int idx;
+	enum buffer_state state;
+	struct llist_node llist_node;
 };
 
 struct core_info{
-	struct spe_buffer primary;
-	struct spe_buffer secondary;
-	unsigned int active_buffer;
+	struct spe_buffer buffers[NUM_BUFFERS];
+	unsigned int reader_buffer;
+	unsigned int spe_engine_buffer;
 	struct perf_event *buffer_full_event;
-	struct irq_work	buffer_full_pending; /* delayed work for NMIs */
+	struct irq_work	buffer_work_queue; /* delayed work for NMIs */
+	enum spe_work_cmd pending_cmd;
+	struct completion cmd_done;
 	u64 old_buffer_val;
-	
+
 	struct spe_ctrl *s;
 	void *buffer_base;
 	/*
@@ -186,7 +215,9 @@ struct core_info{
 struct be_core_info {
 	bool is_throttled;
 	struct irq_work throttled_context;
+	struct irq_work memset_work_queue;
 	struct spe_ctrl *s;
+	struct llist_head memset_head;
 };
 
 #define NUM_BINS 256
@@ -224,7 +255,7 @@ struct spe_ctrl {
 	unsigned int period;
 	unsigned int advance;
 
-	cpumask_var_t target_cpu;
+	cpumask_t target_cpu;
 	int reader_cpu;
 
 	struct task_struct *reader_task;
@@ -243,7 +274,8 @@ struct spe_ctrl {
 	//For sampe based regulation
 	unsigned int samples_in_block, filled_blocks;
 	bool throttle_be_cpus;
-	cpumask_var_t be_cpu;
+	cpumask_t be_cpu;
+	int curr_memset_cpu;
 
 	/* Variable Binning Structures */
 	unsigned int bin_edges_bit[NUM_BINS];
@@ -433,22 +465,6 @@ static inline u16 spe_bw_get_record_counter(void *payload_addr){
 	return counter;
 }
 
-/**
- * budget is used up. PMU generate an interrupt
- * this run in hardirq, nmi context with irq disabled
- */
-static void event_overflow_callback(struct perf_event *event,
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 2, 0)
-					int nmi,
-#endif
-					struct perf_sample_data *data,
-					struct pt_regs *regs)
-{
-	struct core_info *cinfo = this_cpu_ptr(core_info);
-	BUG_ON(!cinfo);
-	irq_work_queue(&cinfo->buffer_full_pending);
-}
-
 static inline int process_record(void *base, struct sample *s);
 
 /*
@@ -473,6 +489,122 @@ static inline u64 spe_guard_buffer_full_event_used(struct core_info *cinfo)
 	return perf_event_count(cinfo->buffer_full_event) - cinfo->old_buffer_val;
 }
 
+static void spe_buffer_init(struct core_info *cinfo, int buf_idx)
+{
+	struct spe_buffer *buff = &cinfo->buffers[buf_idx];
+	buff->buf = cinfo->buffer_base + cinfo->s->size * buf_idx;
+	buff->limit = buff->buf + cinfo->s->size;
+	buff->idx = buf_idx;
+}
+
+static enum buffer_state spe_buffer_get_state(struct spe_buffer *buffer)
+{
+	enum buffer_state state;
+	state = smp_load_acquire(&(buffer->state));
+	return state;
+}
+
+static void spe_buffer_set_full(struct spe_buffer *buffer, void *limit)
+{
+	enum buffer_state state;
+	state = smp_load_acquire(&(buffer->state));
+	BUG_ON(state != FILLING);
+	buffer->limit = limit;
+	smp_store_release(&(buffer->state),FULL);
+	PR_TRACE("Buf %d: FILLING -> FULL", buffer->idx);
+}
+
+static void spe_buffer_set_close(struct spe_buffer *buffer, void *limit)
+{
+	enum buffer_state state;
+	state = smp_load_acquire(&(buffer->state));
+	BUG_ON(state != FILLING);
+	buffer->limit = limit;
+	smp_store_release(&(buffer->state),CLOSE);
+	PR_TRACE("Buf %d: FILLING -> CLOSE", buffer->idx);
+}
+
+/*
+ * WARN: If spe_engine is really fast, it can re-trigger twice even before
+ * spe_reader does swap_spe_buffers. spe_engine recognises it from state 
+ * and waits readiness before proceeding.
+ * Here waiting is not a problem because it runs in soft_irq, but
+ * limited to MAX_SOFTIRQ_WAIT_MS. If anytime this limit is passed,
+ * we should stop instead of overwriting a possibly used buffer.
+ * The risk is to change twice the limit on the same buffer,
+ * locking spe_reader
+ */
+static int spe_buffer_set_filling(struct spe_buffer *buffer,
+					void **base,
+					void **limit)
+{
+	u64 end_wait_time;
+	enum buffer_state state;
+
+	end_wait_time = ktime_get_boottime_ns()
+			+ NSEC_PER_MSEC * MAX_SOFTIRQ_WAIT_MS;
+	while ((state = smp_load_acquire(&(buffer->state))) != READY) {
+		pr_debug_ratelimited("spe_buffer_set_filling():: Buffer not yet READY");
+		cpu_relax();
+		if (ktime_get_boottime_ns() > end_wait_time) {
+			pr_warn("spe_buffer_set_filling()::Waiting too much, spe_engine stops for safety");
+			return -1;
+		}
+	}
+	BUG_ON(state != READY);
+	*base = buffer->buf;
+	*limit = buffer->limit;
+	smp_store_release(&(buffer->state), FILLING);
+	PR_TRACE("Buf %d: READY -> FILLING", buffer->idx);
+	return 0;
+}
+
+static enum buffer_state spe_buffer_is_full(struct spe_buffer *buffer,
+					void **base,
+					void **limit)
+{
+	enum buffer_state state = smp_load_acquire(&(buffer->state));
+	*base = buffer->buf;
+	if (state == FULL || state == CLOSE)
+		*limit = buffer->limit;
+	return state;
+}
+
+// TODO: where samples would have variables sizes, we should advance by min_align
+static void spe_buffer_advance_buf(struct spe_buffer * buffer)
+{
+	buffer->buf += SPE_HW_SAMPLE_SIZE;
+}
+
+static void spe_buffer_set_ready(struct spe_buffer *buffer) {
+	smp_store_release(&(buffer->state), READY);
+	PR_TRACE("Buf %d: FREE -> READY", buffer->idx);
+}
+
+static void spe_buffer_set_free(struct spe_buffer *buffer) {
+	BUG_ON(smp_load_acquire(&buffer->state) != FULL);
+	smp_store_release(&(buffer->state), FREE);
+	PR_TRACE("Buf %d: FULL -> FREE", buffer->idx);
+}
+
+static void print_compare_sysreg_pmu(u64 sysreg, struct core_info *cinfo)
+{
+	pr_debug_ratelimited(
+		"spe_bw_manage_buffer(): samples by SYS_PMBPTR_EL1:%lld by PMU: %lld\n",
+		(
+			sysreg
+			-
+			(
+				(u64)cinfo->buffer_base
+				+ cinfo->spe_engine_buffer
+				* cinfo->s->size
+			)
+		)
+		/SPE_HW_SAMPLE_SIZE,
+		spe_guard_buffer_full_event_used(cinfo)
+	);
+}
+
 static void spe_bw_manage_buffer(struct irq_work *entry)
 {
 	unsigned int cpu = smp_processor_id();
@@ -483,7 +615,8 @@ static void spe_bw_manage_buffer(struct irq_work *entry)
 	u64 buffer_full_new;
 	struct sample s;
 	bool overrun = false;
-	u64 end_wait_time;
+	struct spe_buffer *cur_buf,*next_buf;
+	int ret;
 
 	spe_ctrl = cinfo->s;
 	BUG_ON(!spe_ctrl);
@@ -493,50 +626,19 @@ static void spe_bw_manage_buffer(struct irq_work *entry)
 	spe_bw_disable_and_drain_local();
 
 	cinfo->buffer_full_event->pmu->stop(cinfo->buffer_full_event, PERF_EF_UPDATE);
+
+	//All disabled, now we can relax
+	cur_buf = &cinfo->buffers[cinfo->spe_engine_buffer];
+	next_buf = &cinfo->buffers[OTHER_BUFFER(cinfo->spe_engine_buffer)];
 	reg = read_sysreg_s(SYS_PMBPTR_EL1);
-	pr_debug_ratelimited(
-		"spe_bw_manage_buffer: samples by SYS_PMBPTR_EL1:%lld by PMU: %lld\n",
-		(
-			reg
-			-
-			(
-				(u64)cinfo->buffer_base
-				+ cinfo->active_buffer
-				* spe_ctrl->size
-			)
-		)
-		/SPE_HW_SAMPLE_SIZE,
-		spe_guard_buffer_full_event_used(cinfo)
-	);
+	print_compare_sysreg_pmu(reg, cinfo);
+
 	buffer_full_new = perf_event_count(cinfo->buffer_full_event);
 	cinfo->old_buffer_val = buffer_full_new;
 
-	// TODO:If received an exit request, it shouldn't start on a new buffer
-	if (!READ_ONCE(spe_ctrl->running)) {
-		pr_warn("spe_bw_manage_buffer():: IRQ called but we should be stopped");
-	}
-	/*
-	 * WARN: If spe_engine is really fast, it can re-trigger twice even before
-	 * spe_reader does swap_spe_buffers. spe_engine recognises it from ready
-	 * field already at 1, and waits for it to be 0 before proceeding.
-	 * Here waiting is not a problem because it runs in soft_irq, but
-	 * limited to MAX_SOFTIRQ_WAIT_MS. If anytime this limit is passed,
-	 * we should stop instead of overwriting a possibly used buffer.
-	 * The risk is to change twice the limit on the same buffer,
-	 * locking spe_reader
-	*/
-	end_wait_time = ktime_get_boottime_ns()
-			+ NSEC_PER_MSEC * MAX_SOFTIRQ_WAIT_MS;
-	while (READ_ONCE(cinfo->secondary.ready) == 1) {
-		cpu_relax();
-		if (ktime_get_boottime_ns() > end_wait_time) {
-			pr_warn("spe_bw_manage_buffer()::Waiting too much, spe_reader stops for safety");
-			return;
-		}
-	}
-
 	//Communicate limit
-	cinfo->primary.limit = (void*) reg;
+	BUG_ON(spe_buffer_get_state(cur_buf) != FILLING);
+	spe_buffer_set_full(cur_buf, (void *)reg);
 
 	reg = read_sysreg_s(SYS_PMBSR_EL1);
 	//TODO: Missing check for syndrome
@@ -552,7 +654,7 @@ static void spe_bw_manage_buffer(struct irq_work *entry)
 	if(reg != 0) {
 		pr_warn("spe_bw_manage_buffer(): SYS_PMBSR_EL1: %llx",reg);
 		overrun = true;
-		process_record(cinfo->primary.limit - 64, &s);
+		process_record(cinfo->buffers[cinfo->reader_buffer].limit - 64, &s);
 		pr_warn("Delay from last sample in buffer %lld us",
 			(s.timestamp_module - s.timestamp_spe)/125);
 	}
@@ -571,22 +673,16 @@ static void spe_bw_manage_buffer(struct irq_work *entry)
 		pr_warn_ratelimited("Unknown error code");
 		break;
 	}
-	
+
 	write_sysreg_s(0, SYS_PMBSR_EL1);
 
-	//Allocate secondary_buffer
-	secondary_buf = cinfo->buffer_base
-			+ OTHER_BUFFER(cinfo->active_buffer) 
-			* spe_ctrl->size;
-	/*
-	 * TODO: This memset is potentially expensive, and should not be used in
-	 * irq context. I should have to either make it done by a DMA, or 
-	 * initialise a worker thread.
-	*/
-	memset(secondary_buf,0xff,spe_ctrl->size);
-	secondary_limit = secondary_buf + spe_ctrl->size;
-	// Ensure memset is completed
-	wmb();
+	//Allocate next_buf
+	ret = spe_buffer_set_filling(next_buf,
+					&secondary_buf,
+					&secondary_limit);
+	if(ret != 0)
+		return;
+	cinfo->spe_engine_buffer = OTHER_BUFFER(cinfo->spe_engine_buffer);
 	write_sysreg_s(secondary_buf, SYS_PMBPTR_EL1);
 
 	reg = (u64)secondary_limit;
@@ -594,14 +690,6 @@ static void spe_bw_manage_buffer(struct irq_work *entry)
 	write_sysreg_s(reg, SYS_PMBLIMITR_EL1);
 	isb();
 
-	cinfo->secondary.buf = secondary_buf;
-	cinfo->secondary.limit = secondary_limit;
-	cinfo->secondary.watermark = secondary_buf 
-			+ (spe_ctrl->size)
-			* WATERMARK_NUM
-			/ WATERMARK_DEN;
-	wmb();
-	cinfo->secondary.ready = 1;
 	if(overrun) {
 		pr_warn_ratelimited("Time to serve %lld us", 
 			(READ_CNTCPT_EL0() - s.timestamp_module)*32/1000);
@@ -612,7 +700,6 @@ static void spe_bw_manage_buffer(struct irq_work *entry)
 	reg = spe_bw_fill_pmscr();
 	write_sysreg_s(reg, SYS_PMSCR_EL1);
 	isb();
-	
 }
 
 #ifdef CONFIG_SAMPLE_TS
@@ -826,12 +913,13 @@ static inline int process_record(void *base, struct sample *s)
 	return 0;
 }
 
-
-static void spe_enable_cpu(void *info)
+static void spe_enable_cpu(void)
 {
-	struct spe_ctrl *s = info;
 	u64 reg = 0;
+	void *buffer, *limit;
 	struct core_info *cinfo = this_cpu_ptr(core_info);
+	struct spe_ctrl *s = cinfo->s;
+	int ret;
 	smp_rmb();
 	pr_info("cpu %d : spe_enable",smp_processor_id());
 	pr_debug("core_info address %llx",(u64)core_info);
@@ -844,7 +932,7 @@ static void spe_enable_cpu(void *info)
 		reg |= BIT(SYS_PMSFCR_EL1_LD_SHIFT);
 	if(s->filter_st)
 		reg |= BIT(SYS_PMSFCR_EL1_ST_SHIFT);
-	
+
 	// If at least one filter is active, activate them all
 	if (reg)
 		reg |= BIT(SYS_PMSFCR_EL1_FT_SHIFT);
@@ -857,61 +945,185 @@ static void spe_enable_cpu(void *info)
 	//reg |= FIELD_SET_LOCAL(SYS_PMSIRR_EL1_INTERVAL, s->period);
 	reg |=  s->period;
 	write_sysreg_s(reg, SYS_PMSIRR_EL1);
-	
-	/* Program SPE buffer registers */
-	write_sysreg_s(cinfo->primary.buf, SYS_PMBPTR_EL1);
 
-	reg = (u64)(cinfo->primary.limit);
+	ret = spe_buffer_set_filling(&(cinfo->buffers[cinfo->spe_engine_buffer]),
+						&buffer,
+						&limit);
+	BUG_ON(ret != 0);
+	/* Program SPE buffer registers */
+	write_sysreg_s(buffer, SYS_PMBPTR_EL1);
+
+	reg = (u64)(limit);
 	reg |= BIT(SYS_PMBLIMITR_EL1_E_SHIFT);
 	write_sysreg_s(reg, SYS_PMBLIMITR_EL1);
 	isb();
 	reg = read_sysreg_s(SYS_PMBLIMITR_EL1);
 	pr_debug("SYS_PMBLIMITR_EL1 status: %llx\n",reg);
-	
-	
+
 	//Clear any interrupt state
 	write_sysreg_s(0, SYS_PMBSR_EL1);
 	isb();
 
-	perf_event_enable(cinfo->buffer_full_event);
 	// Set other flags and start sampling
 	reg = spe_bw_fill_pmscr();
 	write_sysreg_s(reg, SYS_PMSCR_EL1);
-
+	complete(&cinfo->cmd_done);
 	isb();
 	pr_debug("SPE engine started on CPU %d\n",smp_processor_id());
 }
 
-static void spe_disable_cpu(void *info)
+static void spe_disable_cpu(void)
 {
 	/* Disable SPE */
 	u64 reg;
 	u64 pmblimitr;
 	struct core_info *cinfo = this_cpu_ptr(core_info);
-	struct spe_ctrl* spe_ctrl = cinfo->s;
-	BUG_ON(!spe_ctrl);
+	BUG_ON(!cinfo);
 
-	disable_percpu_irq(spe_ctrl->irq);
-
+	disable_percpu_irq(cinfo->s->irq);
 	pmblimitr = read_sysreg_s(SYS_PMBLIMITR_EL1);
-	write_sysreg_s(0, SYS_PMBLIMITR_EL1);
+	spe_bw_disable_and_drain_local();
 
-	reg = read_sysreg_s(SYS_PMSCR_EL1);
-	reg = BIT_CLEAR(SYS_PMSCR_EL1_E0SPE, reg);
-	reg = BIT_CLEAR(SYS_PMSCR_EL1_E1SPE, reg);
-	write_sysreg_s(reg, SYS_PMSCR_EL1);
-	isb();
-
-	perf_event_disable(cinfo->buffer_full_event);
-	perf_event_release_kernel(cinfo->buffer_full_event); 
-	cinfo->buffer_full_event = NULL; 
-	
 	reg = read_sysreg_s(SYS_PMBSR_EL1);
 	PR_DEBUG("PMBSR_EL1 status: %llx\n",reg);
 	reg = read_sysreg_s(SYS_PMBPTR_EL1);
+	spe_buffer_set_close(&cinfo->buffers[cinfo->spe_engine_buffer],
+					(void *)reg);
 	PR_DEBUG("SYS_PMBPTR_EL1 status: %llx\n", reg);
 	PR_DEBUG("SYS_PMBLIMITR_EL1 status: %llx\n", pmblimitr);
 	PR_DEBUG("The IRQ had been called %d times", irq_called);
+	complete(&cinfo->cmd_done);
+}
+
+/************* Tricks for calling functions in irq_work on any CPU ************/
+/*
+ * 	spe_guard_memset_work_req()
+ *	-> spe_guard_memset_work_trigger()
+ *	-> spe_guard_memset_work_fn()
+ */
+
+/*
+ * A spe_buf that inside here is not yet FREE is an error, caller should set
+ * FREE before calling
+ */
+static void spe_guard_memset_work_fn(struct irq_work *entry) {
+	struct be_core_info *cinfo = this_cpu_ptr(be_core_info);
+	struct llist_node* to_set = llist_del_all(&cinfo->memset_head);
+	struct llist_node *elem, *_n;
+	to_set = llist_reverse_order(to_set);
+	llist_for_each_safe(elem, _n, to_set){
+		struct spe_buffer *spe_buf = llist_entry(elem,
+							struct spe_buffer,
+							llist_node);
+		BUG_ON(spe_buffer_get_state(spe_buf) != FREE);
+		memset(spe_buf->buf,0xff,cinfo->s->size);
+		spe_buffer_set_ready(spe_buf);
+	}
+}
+
+static void spe_guard_memset_work_trigger(void *info) {
+	struct be_core_info *cinfo = this_cpu_ptr(be_core_info);
+	BUG_ON(!cinfo);
+	irq_work_queue(&cinfo->memset_work_queue);
+	PR_TRACE("spe_guard_memset_work_trigger():: in_irq=%s", TEST(in_irq()));
+}
+
+call_single_data_t g_csd_memset_work_trigger_data = {
+	.func=spe_guard_memset_work_trigger,
+	.info = NULL
+};
+
+static void spe_guard_memset_work_req(struct core_info *cinfo)
+{
+	struct spe_ctrl *s = cinfo->s;
+	struct be_core_info * becinfo;
+	int next_memset_cpu;
+	next_memset_cpu = cpumask_next(s->curr_memset_cpu, &(s->be_cpu));
+	while(next_memset_cpu >= nr_cpu_ids) {
+		if (next_memset_cpu >= nr_cpu_ids)
+			next_memset_cpu = 0;
+		next_memset_cpu = cpumask_next(next_memset_cpu, &(s->be_cpu));
+	}
+	becinfo = per_cpu_ptr(be_core_info,next_memset_cpu);
+	PR_TRACE("spe_guard_memset_work_req():: req to be cpu %d", next_memset_cpu);
+	s->curr_memset_cpu = next_memset_cpu;
+
+	llist_add(&(cinfo->buffers[cinfo->reader_buffer].llist_node),
+			&becinfo->memset_head);
+	smp_call_function_single_async(next_memset_cpu,
+				&g_csd_memset_work_trigger_data);
+	return;
+}
+
+/* 	spe_guard_buffer_work_req()
+ *	-> spe_guard_buffer_work_trigger()
+ *	-> spe_guard_buffer_work_fn ()
+ */
+static void spe_guard_buffer_work_fn(struct irq_work *w)
+{
+	struct core_info *cinfo = this_cpu_ptr(core_info);
+	switch (xchg(&cinfo->pending_cmd, CMD_NONE)) {
+	case CMD_ENABLE:
+		spe_enable_cpu();
+		break;
+	case CMD_MANAGE:
+		/* late doorbell after stop request */
+		spe_bw_manage_buffer(w);
+		break;
+	case CMD_SHUTDOWN:
+		spe_disable_cpu();
+		break;
+	case CMD_NONE:
+		pr_info("spe_guard_buffer_work_fn():: Spurious call");
+		break;
+	}
+}
+
+static void spe_guard_buffer_work_trigger(void *_info)
+{
+	struct core_info *cinfo = this_cpu_ptr(core_info);
+	irq_work_queue(&cinfo->buffer_work_queue);
+}
+
+call_single_data_t g_csd_buffer_work_trigger_data = {
+	.func = spe_guard_buffer_work_trigger,
+	.info = NULL
+};
+
+/*
+ * It can and should fail if CMD_SHUTDOWN is already set
+ * It can fail if CMD_MANAGE is set, but I want to SHUTDOWN, but can retry
+ */
+static enum spe_work_cmd spe_guard_buffer_work_req(int cpu, enum spe_work_cmd cmd)
+{
+	struct core_info *cinfo = per_cpu_ptr(core_info, cpu);
+	enum spe_work_cmd old = cmpxchg(&cinfo->pending_cmd, CMD_NONE, cmd);
+	BUG_ON(!cinfo);
+	if (old != CMD_NONE && old != cmd)
+		pr_warn("bw cmd collision %d vs %d on cpu %d", old, cmd, cpu);
+	else
+	{
+		smp_call_function_single_async(cpu,
+						&g_csd_buffer_work_trigger_data);
+	}
+	return old;
+}
+
+/**
+ * budget is used up. PMU generate an interrupt
+ * this run in hardirq, nmi context with irq disabled
+ */
+static void event_overflow_callback(struct perf_event *event,
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 2, 0)
+					int nmi,
+#endif
+					struct perf_sample_data *data,
+					struct pt_regs *regs)
+{
+	struct core_info *cinfo = this_cpu_ptr(core_info);
+	BUG_ON(!cinfo);
+	if(spe_guard_buffer_work_req(smp_processor_id(), CMD_MANAGE) != CMD_NONE)
+		pr_info("event_overflow_callback():: Cannot ask for CMD_MANAGE");
 }
 
 #if CONFIG_PERF_OPTIMISED < 2
@@ -957,14 +1169,37 @@ static unsigned long get_exact_cntpct(void)
 
 #endif
 
+/*
+ * TODO: For now we do READ while FILLING, so we set FREE. 
+ * Prefer to always live on the completed buffer, until next is ready
+ */
 static void swap_spe_buffers(struct core_info *cinfo)
 {
-	cinfo->active_buffer = OTHER_BUFFER(cinfo->active_buffer);
-	SWAP(cinfo->primary.buf,cinfo->secondary.buf);
-	SWAP(cinfo->primary.limit,cinfo->secondary.limit);
-	SWAP(cinfo->primary.watermark,cinfo->secondary.watermark);
-	smp_wmb();
-	cinfo->secondary.ready = 0;
+	struct spe_buffer *next_buf, *cur_buf;
+	enum buffer_state cur_buf_state, next_buf_state;
+	// If current state is close, dead cycle on limit until thread stops
+	cur_buf = &cinfo->buffers[cinfo->reader_buffer];
+	cur_buf_state = spe_buffer_get_state(cur_buf);
+	if( cur_buf_state == CLOSE)
+		return;
+	next_buf = &cinfo->buffers[OTHER_BUFFER(cinfo->reader_buffer)];
+	next_buf_state = spe_buffer_get_state(next_buf);
+	if (next_buf_state != FILLING
+		&& next_buf_state != FULL
+		&& next_buf_state != CLOSE
+	) {
+		return; //Next buffer cannot be taken
+	}
+	//Re-init current buffer for later use
+	spe_buffer_init(cinfo, cinfo->reader_buffer);
+	// We can pass current buffer to new owner
+	spe_buffer_set_free(cur_buf);
+	// Here we should request for the memset, later is done after READ.
+	// If closing, this and next buffer are the last ones
+	if (next_buf_state != CLOSE){
+		spe_guard_memset_work_req(cinfo);
+	}
+	cinfo->reader_buffer = OTHER_BUFFER(cinfo->reader_buffer);
 }
 
 #if defined(CONFIG_TEST_BIN_ASSIGNMENT) && defined(CONFIG_BINARY_SEARCH)
@@ -1303,7 +1538,7 @@ static void evaluate_regulation(struct spe_ctrl *s)
 	} else if (throttle_cores && !READ_ONCE(s->throttle_be_cpus)) {
 		throttled_period++;
 		WRITE_ONCE(s->throttle_be_cpus, true);
-		for_each_cpu(i, s->be_cpu){
+		for_each_cpu(i, &(s->be_cpu)){
 			smp_call_function_single(i,
 					throttle_thread,
 					s, 0);
@@ -1376,21 +1611,34 @@ static bool try_read_record(struct spe_ctrl *s,
 	int ret = -1;
 	unsigned long long ts_before_process;
 	u64 ones_mask = ~0x0; // This should make an all ones mask
+	u64 next_to_read;
 	struct core_info * cinfo = per_cpu_ptr(core_info,cpu);
 	struct sample sample = {0};
 	struct ring_elem *elem;
+	struct spe_buffer *cur_buf = &cinfo->buffers[cinfo->reader_buffer];
+	void *limit, *base;
+	enum buffer_state cur_state;
 	/*
 		* spe_buf::limit can change out of the control of
 		* current thread's control.
 	*/
-	void *limit = READ_ONCE(cinfo->primary.limit);
-	u64 next_to_read = READ_ONCE(*(u64 *)(cinfo->primary.buf + s->advance));
+	cur_state = spe_buffer_is_full(cur_buf, &base, &limit);
+	if(cur_state != FILLING && cur_state != FULL && cur_state != CLOSE)
+		return false;
+
+	next_to_read = READ_ONCE(*(u64 *)(base + s->advance));
 	//TODO: evaluate this barrier, maybe it can be removed
 	smp_rmb();
-	if (cinfo->primary.buf < limit &&
+	/*
+	 * TODO: if setting advance to more than 1, we should better understand
+	 * what limit to take. If I look past the limit, I obviously cannot find
+	 * any written data. Solution: if base + advance is past limit, just use
+	 * base
+	 */
+	if (base < limit &&
 		next_to_read != ones_mask)
 	{
-		PR_TRACE("SPE record at %llx\n",(u64) cinfo->primary.buf);
+		PR_TRACE("SPE record at %llx\n",(u64) base);
 
 		ts_before_process = get_exact_cntpct();
 
@@ -1401,8 +1649,8 @@ static bool try_read_record(struct spe_ctrl *s,
 			return -1;
 		}
 
-		elem = cinfo->primary.buf;
-		cinfo->primary.buf += SPE_HW_SAMPLE_SIZE;
+		elem = base;
+		spe_buffer_advance_buf(cur_buf);
 		update_stats_arr(ts_before_process);
 
 		bin_sample(s, &sample);
@@ -1410,9 +1658,14 @@ static bool try_read_record(struct spe_ctrl *s,
 		if (spe_ring_push_sample_try(&(s->spe_ring[cpu]), elem) != 0)
 			overflowed_samples++;
 	}
-
-	// Restore a waiting buffer, if the secondary is ready
-	if(cinfo->primary.buf == limit && READ_ONCE(cinfo->secondary.ready))
+	/*
+	 * TODO: here we do one additional call, becasue we checked on the
+	 * previously retrieved base. On last advance we should not hit this if
+	 * and hit the next time without reading anything.
+	 * Pass to next buffer if current is complete, readiness checked inside
+	 */
+	if(	base == limit
+		&& (cur_state == CLOSE || cur_state == FULL))
 		swap_spe_buffers(cinfo);
 	return (ret == 0);
 }
@@ -1429,7 +1682,7 @@ static int spe_reader(void *data)
 	while (at_least_one_reading || !kthread_should_stop() ) {
 		at_least_one_reading = false;
 
-		for_each_cpu(cpu, s->target_cpu){
+		for_each_cpu(cpu, &(s->target_cpu)){
 			if(try_read_record(s, cpu))
 				at_least_one_reading = true;
 		}
@@ -1522,10 +1775,11 @@ static struct perf_event *init_counter(struct spe_ctrl *s, int cpu, int budget, 
 static ssize_t sysfs_store_control(struct kobject *kobj,
 				struct kobj_attribute *attr,
 				const char *buf, size_t count)
-{	
+{
 	// Resetting extended packets counter;
 	bool alloc_failed = false;
 	int i;
+	enum spe_work_cmd cur_cmd;
 	extended_packets = 0;
 	if (sysfs_streq(buf, "start")) {
 		if (spe.running)
@@ -1548,48 +1802,39 @@ static ssize_t sysfs_store_control(struct kobject *kobj,
 
 		spe.num_samples = 0;
 		spe.throttle_be_cpus = false;
-		for_each_cpu(i, spe.be_cpu) {
+		if(cpumask_empty(&(spe.be_cpu))) {
+			pr_info("Need at least one be cpu");
+			return count;
+		}
+		for_each_cpu(i, &(spe.be_cpu)) {
 			struct be_core_info *cinfo = per_cpu_ptr(be_core_info,i);
 			init_irq_work(&cinfo->throttled_context, throttle_thread_soft);
+			init_irq_work(&cinfo->memset_work_queue, spe_guard_memset_work_fn);
+			init_llist_head(&cinfo->memset_head);
 			cinfo->s = &spe;
 		}
-		for_each_cpu(i, spe.target_cpu){
+		for_each_cpu(i, &(spe.target_cpu)){
 			struct core_info *cinfo = per_cpu_ptr(core_info,i);
+			int j;
+			cinfo->reader_buffer = 0;
+			cinfo->spe_engine_buffer = 0;
+			cinfo->pending_cmd = CMD_NONE;
+			init_completion(&cinfo->cmd_done);
+			cinfo->s = &spe;
 			// Allocate 2 buffers of size BUFFER_SIZE per core
-			cinfo->buffer_base = kmalloc(spe.size * 2, GFP_KERNEL);
+			cinfo->buffer_base = kvmalloc(spe.size * NUM_BUFFERS, GFP_KERNEL);
 			if(!cinfo->buffer_base)
 				alloc_failed = true;
 			else
-				memset(cinfo->buffer_base, 0xff, spe.size * 2);
-			//TODO: This will be refactored to be more concise
-			cinfo->primary = (struct spe_buffer){
-				.buf = cinfo->buffer_base,
-				.limit = cinfo->buffer_base + spe.size,
-				.watermark = cinfo->buffer_base + 
-					(
-						spe.size
-						*WATERMARK_NUM
-						/WATERMARK_DEN
-					),
-				.ready = 0
-			};
-			cinfo->secondary = (struct spe_buffer){
-				.buf = cinfo->buffer_base + spe.size,
-				.limit = cinfo->buffer_base + 2 * spe.size,
-				.watermark = cinfo->buffer_base 
-					+ spe.size
-					+(
-						spe.size
-						*WATERMARK_NUM
-						/WATERMARK_DEN
-					),
-				.ready = 0
-			};
+				memset(cinfo->buffer_base, 0xff, spe.size * NUM_BUFFERS);
 
-			cinfo->active_buffer = 0;
-			cinfo->s = &spe;
+			for(j = 0; j < NUM_BUFFERS; j++) {
+				spe_buffer_init(cinfo, j);
+				spe_buffer_set_ready(&cinfo->buffers[j]);
+			}
+
 			/* initialize nmi irq_work_queue */
-			init_irq_work(&cinfo->buffer_full_pending, spe_bw_manage_buffer);
+			init_irq_work(&cinfo->buffer_work_queue, spe_guard_buffer_work_fn);
 			cinfo->buffer_full_event = init_counter(&spe,
 						i,
 						spe.size/SPE_HW_SAMPLE_SIZE
@@ -1599,16 +1844,18 @@ static ssize_t sysfs_store_control(struct kobject *kobj,
 						event_overflow_callback);
 			if(!cinfo->buffer_full_event)
 				alloc_failed = true;
+			else
+				perf_event_enable(cinfo->buffer_full_event);
 		}
 		if(alloc_failed){
-			for_each_cpu(i, spe.target_cpu){
+			for_each_cpu(i, &(spe.target_cpu)){
 				struct core_info *cinfo = per_cpu_ptr(core_info,i);
-				kfree(cinfo-> buffer_base);
+				kvfree(cinfo-> buffer_base);
 				cinfo-> buffer_base = NULL;
 			}
 			return -ENOMEM;
 		}
-		
+
 		smp_wmb();
 		memset(spe_bw_management_called,0,sizeof(spe_bw_management_called));
 		/* Start reader thread pinned */
@@ -1623,13 +1870,16 @@ static ssize_t sysfs_store_control(struct kobject *kobj,
 		wake_up_process(spe.reader_task);
 
 		/* Enable SPE on target CPU */
-		// TODO: remove wait true and change with semaphore
-		for_each_cpu(i, spe.target_cpu){
-			smp_call_function_single(i,
-					spe_enable_cpu,
-					&spe, 1);
+		for_each_cpu(i, &(spe.target_cpu)){
+			cur_cmd = spe_guard_buffer_work_req(i, CMD_ENABLE);
+			BUG_ON(cur_cmd != CMD_NONE);
 		}
-		
+		for_each_cpu(i, &(spe.target_cpu)){
+			struct core_info *cinfo = per_cpu_ptr(core_info,i);
+			wait_for_completion(&cinfo->cmd_done);
+			reinit_completion(&cinfo->cmd_done);
+		}
+
 		spe.running = true;
 		pr_info("SPE started\n");
 	}
@@ -1639,23 +1889,33 @@ static ssize_t sysfs_store_control(struct kobject *kobj,
 		if (!spe.running)
 			return count;
 
-		for_each_cpu(i, spe.target_cpu){
-			smp_call_function_single(i, spe_disable_cpu,
-					&spe, 1);
+		for_each_cpu(i, &(spe.target_cpu)){
+			cur_cmd = CMD_SHUTDOWN;
+			while (cur_cmd != CMD_NONE)
+				cur_cmd = spe_guard_buffer_work_req(i, CMD_SHUTDOWN);
+			BUG_ON(cur_cmd != CMD_NONE);
+		}
+		for_each_cpu(i, &(spe.target_cpu)){
+			struct core_info *cinfo = per_cpu_ptr(core_info,i);
+			perf_event_disable(cinfo->buffer_full_event);
+			wait_for_completion(&cinfo->cmd_done);
+			reinit_completion(&cinfo->cmd_done);
+			perf_event_release_kernel(cinfo->buffer_full_event);
+			cinfo->buffer_full_event = NULL;
 		}
 
 		if (spe.reader_task)
 			kthread_stop(spe.reader_task);
 
-		for_each_cpu(i, spe.target_cpu){
+		for_each_cpu(i, &(spe.target_cpu)){
 			struct core_info *cinfo = per_cpu_ptr(core_info,i);
-			kfree(cinfo-> buffer_base);
+			kvfree(cinfo-> buffer_base);
 			cinfo-> buffer_base = NULL;
 		}
 
 		WRITE_ONCE(spe.throttle_be_cpus, false);
 
-		for_each_cpu(i, spe.be_cpu){
+		for_each_cpu(i, &(spe.be_cpu)){
 			struct be_core_info *cinfo = per_cpu_ptr(be_core_info,i);
 			while(READ_ONCE(cinfo->is_throttled)) {
 				smp_mb();
@@ -1664,7 +1924,7 @@ static ssize_t sysfs_store_control(struct kobject *kobj,
 		}
 
 		spe.running = false;
-		
+
 		pr_info("sysfs_store_control: SPE stopped\n");
 		pr_debug("sysfs_store_control: Found %d extended packets\n",extended_packets);	
 		pr_debug("First TS seen: %lld, last TS seen: %lld\n", first_ts,last_ts);
@@ -1697,7 +1957,7 @@ static ssize_t sysfs_store_target_cpu(struct kobject *kobj,
 			     const char *buf, size_t count)
 {
 	int ret;
-	if((ret = cpumask_parse(buf, spe.target_cpu)) < 0)
+	if((ret = cpumask_parse(buf, &(spe.target_cpu))) < 0)
 		return ret;
 	return count;
 }
@@ -1707,7 +1967,7 @@ static ssize_t sysfs_store_be_cpu(struct kobject *kobj,
 				const char *buf, size_t count)
 {
 	int ret;
-	if((ret = cpumask_parse(buf, spe.be_cpu)) < 0)
+	if((ret = cpumask_parse(buf, &(spe.be_cpu))) < 0)
 		return ret;
 	return count;
 }
@@ -1804,11 +2064,7 @@ out_err:
 	ret = SPE_BW_BUF_FAULT_ACT_FATAL;
 
 out_stop:
-	/*
-	 * TODO: Fix this as I don't like calling spe_disable_cpu from 2 
-	 * different places
-	 */
-	spe_disable_cpu(&spe);
+	spe_guard_buffer_work_req(smp_processor_id(), CMD_SHUTDOWN);
 	if (spe.reader_task)
 		kthread_stop(spe.reader_task);
 
@@ -1816,7 +2072,7 @@ out_stop:
 	 * TODO: We just stopped the thread, so maybe freeing 
 	 * already the buffer is too early
 	*/
-	kfree(cinfo->buffer_base);
+	kvfree(cinfo->buffer_base);
 	cinfo-> buffer_base = NULL;
 
 	spe.running = false;
@@ -2224,8 +2480,6 @@ static int __init spe_guard_init(void)
 
 	precompute_ref_integral(&spe);
 	memset(global, 0, sizeof(struct spe_ctrl));
-	zalloc_cpumask_var(&global->target_cpu, GFP_NOWAIT);
-	zalloc_cpumask_var(&global->be_cpu, GFP_NOWAIT);
 	ts_stats_arr = vmalloc(sizeof(struct ts_stats)*NUM_STATS_RECORDS);
 	if(!ts_stats_arr){
 		// Nothing else was allocated/initialised
@@ -2319,8 +2573,8 @@ clean_exit:
 // Exit function (called when the module is removed)
 static void __exit spe_guard_exit(void)
 {
-	free_cpumask_var(spe.target_cpu);
-	free_cpumask_var(spe.be_cpu);
+	free_cpumask_var(&spe.target_cpu);
+	free_cpumask_var(&spe.be_cpu);
 	platform_driver_unregister(&spe_bw_driver);
 	sysfs_remove_file(spe_kobj, &control_attr.attr);
 	sysfs_remove_file(spe_kobj, &target_cpu_attr.attr);
